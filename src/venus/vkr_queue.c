@@ -230,7 +230,7 @@ vkr_queue_thread(void *arg)
       static int avrt_tried = 0;
       if (!avrt_tried) {
          avrt_tried = 1;
-         HMODULE h = LoadLibraryW(L"avrt.dll");
+         HMODULE h = LoadLibraryExW(L"avrt.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
          if (h)
             pAvSet = (PFN_AvSetMmThreadCharacteristicsW)
                GetProcAddress(h, "AvSetMmThreadCharacteristicsW");
@@ -461,6 +461,8 @@ vkr_dispatch_vkQueueSubmit(UNUSED struct vn_dispatch_context *dispatch,
    args->ret =
       vk->QueueSubmit(args->queue, args->submitCount, args->pSubmits, args->fence);
    mtx_unlock(&queue->vk_mutex);
+   if (args->ret != VK_SUCCESS)
+      winq_dbg("FAIL QueueSubmit ret=%d", (int)args->ret);
 }
 
 static void
@@ -502,6 +504,8 @@ vkr_dispatch_vkQueueSubmit2(UNUSED struct vn_dispatch_context *dispatch,
    args->ret =
       vk->QueueSubmit2(args->queue, args->submitCount, args->pSubmits, args->fence);
    mtx_unlock(&queue->vk_mutex);
+   if (args->ret != VK_SUCCESS)
+      winq_dbg("FAIL QueueSubmit2 ret=%d", (int)args->ret);
 }
 
 static void

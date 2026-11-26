@@ -17,6 +17,7 @@
 
 #include "util/anon_file.h"
 #include "util/os_file.h"
+#include "vrend/vrend_winq_share.h"
 #include "venus-protocol/vn_protocol_renderer_dispatches.h"
 
 #define XXH_INLINE_ALL
@@ -196,6 +197,11 @@ static inline void
 vkr_context_free_resource(struct hash_entry *entry)
 {
    struct vkr_resource *res = entry->data;
+#ifdef _WIN32
+   /* winq: the id may be used again for other memory */
+   if (res->winq_venus_export)
+      vkr_winq_export_registry_clear(res->res_id);
+#endif
    if (res->fd_type == VIRGL_RESOURCE_FD_SHM)
       munmap(res->u.data, res->size);
    else if (res->u.fd >= 0)
@@ -244,6 +250,14 @@ vkr_context_import_resource_internal(struct vkr_context *ctx,
    res->res_id = res_id;
    res->fd_type = fd_type;
    res->size = blob_size;
+   res->winq_gl = false;
+   res->winq_gl_mem_type = 0;
+   res->winq_venus_export = false;
+#ifdef _WIN32
+   if (fd_type == VIRGL_RESOURCE_FD_OPAQUE && fd >= 0)
+      res->winq_gl =
+         vrend_winq_share_registry_get(res_id, os_get_win32_handle_from_fd(fd), &res->winq_gl_mem_type);
+#endif
 
    /* fd and mmap_ptr cannot be valid at the same time, but allowed to be -1 and NULL */
    assert(fd < 0 || !mmap_ptr);
@@ -358,6 +372,23 @@ vkr_context_create_resource_from_device_memory(struct vkr_context *ctx,
       os_close_fd(blob.u.fd);
       return false;
    }
+   {
+      /* winq: this is memory the context allocated itself, never an OpenGL texture */
+      struct vkr_resource *winq_res = vkr_context_get_resource(ctx, res_id);
+      if (winq_res)
+         winq_res->winq_gl = false;
+#ifdef _WIN32
+      /* winq: memory the guest allocated for export can be imported by another context, which has to
+       * use the type and size it was allocated with (see vkr_dispatch_vkAllocateMemory) */
+      const struct vkr_physical_device *winq_pdev = mem->device ? mem->device->physical_device : NULL;
+      if (winq_res && mem->might_export && winq_res->fd_type != VIRGL_RESOURCE_FD_SHM && winq_pdev &&
+          winq_pdev->id_properties.deviceLUIDValid)
+         winq_res->winq_venus_export =
+            vkr_winq_export_registry_set(res_id, mem->memory_type_index, mem->allocation_size,
+                                         winq_pdev->id_properties.deviceLUID,
+                                         os_get_win32_handle_from_fd(winq_res->u.fd));
+#endif
+   }
 
    *out_blob = blob;
 
@@ -389,6 +420,7 @@ vkr_context_import_resource(struct vkr_context *ctx,
                             int fd,
                             uint64_t size)
 {
+   winq_dbg("ServerImport res=%u fd_type=%d fd=%d size=%llu", res_id, (int)fd_type, fd, (unsigned long long)size);
    if (fd_type == VIRGL_RESOURCE_FD_SHM)
       return vkr_context_import_resource_from_shm(ctx, res_id, size, fd);
 

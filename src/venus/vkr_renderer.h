@@ -35,6 +35,12 @@ vkr_renderer_init(uint32_t flags, const struct vkr_renderer_callbacks *cbs);
 void
 vkr_renderer_fini(void);
 
+void
+vkr_renderer_set_memory_limit(uint64_t limit);
+
+uint64_t
+vkr_renderer_get_memory_used(void);
+
 bool
 vkr_renderer_create_context(uint32_t ctx_id,
                             uint32_t ctx_flags,

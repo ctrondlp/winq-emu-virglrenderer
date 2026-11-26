@@ -11,6 +11,11 @@
 struct vkr_image {
    struct vkr_object base;
 
+   /* winq: the host image has VK_IMAGE_TILING_LINEAR (after the modifier shim, if any ran).  The
+    * guest creates its scanout and export images like this; vkr_physical_device_remap_memory_type_bits
+    * steers them to host visible memory so the device can read their pixels. */
+   bool linear_tiling;
+
 #ifdef _WIN32
    /* Set when the image was created through the VK_EXT_image_drm_format_modifier
     * shim: the guest asked for tiling=DRM_FORMAT_MODIFIER_EXT with a
@@ -21,6 +26,18 @@ struct vkr_image {
     * tiling), but on the host we need VK_IMAGE_ASPECT_COLOR_BIT (the
     * aspect valid for LINEAR). */
    bool dma_buf_shim_linear;
+
+   /* winq: what a linear image was created with, kept in case it is bound to the memory of an OpenGL
+    * texture: the host image is then replaced by one with optimal tiling (see winq_gl_image_create in vkr_image.c).
+    * winq_gl_format is the format of the replacement if it differs from what the guest asked for,
+    * else VK_FORMAT_UNDEFINED. */
+   VkImageCreateInfo winq_create_info;
+   bool winq_create_info_valid;
+   VkFormat winq_gl_format;
+   /* winq: the image is bound to the memory of an OpenGL texture */
+   bool winq_gl_bound;
+   /* winq: the image is bound to memory (of any kind), it can no longer be replaced */
+   bool winq_bound;
 #endif
 };
 VKR_DEFINE_OBJECT_CAST(image, VK_OBJECT_TYPE_IMAGE, VkImage)

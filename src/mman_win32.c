@@ -26,6 +26,7 @@
 #include <io.h>
 
 #include "mman_win32.h"
+#include "util/os_file.h"
 
 #ifndef FILE_MAP_EXECUTE
 #define FILE_MAP_EXECUTE    0x0020
@@ -116,24 +117,27 @@ void *mmap(void *addr, size_t len, int prot, int flags, int fildes, intptr_t off
    if ((flags & MAP_ANONYMOUS) != 0) {
       h = INVALID_HANDLE_VALUE;
    } else {
-      h = (HANDLE)_get_osfhandle(fildes);
-      if (h == INVALID_HANDLE_VALUE) {
-         /* fildes may be a raw HANDLE (e.g. from CreateFileMapping passed as int
-          * through the Venus proxy protocol). Try using it directly.
-          */
-         h = (HANDLE)(intptr_t)fildes;
+      /* fildes is a CRT fd or a handle token from os_wrap_win32_handle.  An
+       * int that is neither is rejected; it is never used as a raw HANDLE
+       * value, which could name an unrelated object of this process.
+       */
+      h = os_get_win32_handle_from_fd(fildes);
+      if (h == INVALID_HANDLE_VALUE || h == NULL) {
+         errno = EBADF;
+         return MAP_FAILED;
       }
    }
 
-   fm = CreateFileMappingW(h, NULL, protect, dwMaxSizeHigh, dwMaxSizeLow, NULL);
-
-   if (fm == NULL && (flags & MAP_ANONYMOUS) == 0) {
-      /* h may already be a file mapping handle (e.g. from os_create_anonymous_file
-       * which wraps CreateFileMapping + _open_osfhandle). CreateFileMapping fails
-       * when given a mapping handle instead of a file handle. Try using h directly.
+   fm = NULL;
+   if ((flags & MAP_ANONYMOUS) == 0 && os_fd_is_handle_token(fildes)) {
+      /* Tokens wrap section (file mapping) handles, e.g. from
+       * os_create_anonymous_file; map those directly.  Tokens that wrap
+       * other kinds of handles simply fail in MapViewOfFile below.
        */
       fm = h;
       h = NULL; /* signal that we're borrowing, not owning fm */
+   } else {
+      fm = CreateFileMappingW(h, NULL, protect, dwMaxSizeHigh, dwMaxSizeLow, NULL);
    }
 
    if (fm == NULL) {

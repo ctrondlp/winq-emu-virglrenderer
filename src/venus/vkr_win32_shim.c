@@ -223,6 +223,10 @@ vkr_win32_CreateBuffer(VkDevice device,
 /* CreateImage shim                                                    */
 /* ------------------------------------------------------------------ */
 
+/* winq: set by a caller on its own thread around a CreateImage whose tiling must stay as it is: an
+ * image for memory that OpenGL lays out (optimal), see winq_gl_image_create in vkr_image.c. */
+_Thread_local bool vkr_win32_shim_keep_tiling;
+
 static VKAPI_ATTR VkResult VKAPI_CALL
 vkr_win32_CreateImage(VkDevice device,
                       const VkImageCreateInfo *pCreateInfo,
@@ -275,7 +279,7 @@ vkr_win32_CreateImage(VkDevice device,
       }
    }
    if (ext_info && ext_info->handleTypes &&
-       info_in->tiling != VK_IMAGE_TILING_LINEAR) {
+       info_in->tiling != VK_IMAGE_TILING_LINEAR && !vkr_win32_shim_keep_tiling) {
       info_local = *info_in;
       info_local.tiling = VK_IMAGE_TILING_LINEAR;
       info_in = &info_local;
@@ -431,7 +435,8 @@ vkr_win32_ImportFenceFdKHR(VkDevice device,
 
    VkResult result =
       entry->dev->ImportFenceWin32HandleKHR(device, &win32_info);
-   if (dup_handle != INVALID_HANDLE_VALUE && result != VK_SUCCESS)
+   /* NT handle imports never take ownership, close the duplicate either way */
+   if (dup_handle != INVALID_HANDLE_VALUE)
       CloseHandle(dup_handle);
    return result;
 }
@@ -474,7 +479,8 @@ vkr_win32_ImportSemaphoreFdKHR(
 
    VkResult result =
       entry->dev->ImportSemaphoreWin32HandleKHR(device, &win32_info);
-   if (dup_handle != INVALID_HANDLE_VALUE && result != VK_SUCCESS)
+   /* NT handle imports never take ownership, close the duplicate either way */
+   if (dup_handle != INVALID_HANDLE_VALUE)
       CloseHandle(dup_handle);
    return result;
 }
@@ -619,7 +625,15 @@ vkr_win32_device_install_shim(struct vkr_device *dev)
     * (Buffer, Image, DeviceMemory) are NOT deferred — keeping them
     * alive would exhaust GPU memory.  Similarly, pool types (CommandPool,
     * DescriptorPool) manage sub-resources and are left alone.
+    *
+    * The deferred list is only freed at device teardown and grows with every
+    * object the guest destroys, so a guest that keeps creating and destroying
+    * objects grows host memory without bound.  Only pay that price on the
+    * driver that needs it.
     */
+   if (dev->physical_device->properties.vendorID != 0x8086 /* Intel */)
+      return;
+
    vk->DestroyDescriptorSetLayout = vkr_win32_DestroyDescriptorSetLayout;
    vk->DestroyPipelineLayout = vkr_win32_DestroyPipelineLayout;
    vk->DestroyPipeline = vkr_win32_DestroyPipeline;

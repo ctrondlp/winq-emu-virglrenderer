@@ -10,6 +10,7 @@
 #include <errno.h>
 #include <io.h>
 #include "mman_win32.h"
+#include "util/os_file.h"
 #else
 #include <signal.h>
 #include <sys/wait.h>
@@ -158,12 +159,6 @@ server_recv_with_fds(int fd, void *data, size_t size,
 }
 
 static bool
-server_send_reply(int fd, const void *data, size_t size)
-{
-   return server_send_all(fd, data, size);
-}
-
-static bool
 server_send_reply_with_fds(int fd, const void *data, size_t size,
                            const int *fds, int fd_count)
 {
@@ -215,16 +210,10 @@ server_retire_fence_cb(uint32_t ctx_id, uint32_t ring_idx, uint64_t fence_id)
    mtx_unlock(&state->workers_mutex);
 }
 
-static void
-server_cb_debug_logger(UNUSED enum virgl_log_level_flags log_level,
-                       const char *message,
-                       UNUSED void *user_data)
-{
-   (void)message;
-}
-
+/* No logger: the server runs in the embedder's process and its messages go to the embedder's log
+ * (a no-op logger here used to replace that for the whole process, silencing vrend as well). */
 static const struct vkr_renderer_callbacks server_vkr_cbs = {
-   .debug_logger = server_cb_debug_logger,
+   .debug_logger = NULL,
    .retire_fence = server_retire_fence_cb,
 };
 
@@ -310,9 +299,16 @@ server_context_worker_thread(void *arg)
          w->shmem_ptr = mmap(NULL, w->shmem_size, PROT_READ | PROT_WRITE,
                              MAP_SHARED, w->shmem_fd, 0);
          if (w->shmem_ptr == MAP_FAILED) {
+            w->shmem_ptr = NULL;
             goto done;
          }
          w->timeline_seqnos = (atomic_uint *)w->shmem_ptr;
+
+         /* The worker owns its copy of the fd (proxy_socket_send_request_with_fds
+          * duplicates it); the mapped view keeps the memory alive without it.
+          */
+         os_close_fd(w->shmem_fd);
+         w->shmem_fd = -1;
 
          for (int i = 0; i < w->timeline_count; i++)
             atomic_store(&w->timeline_seqnos[i], 0);
@@ -416,8 +412,12 @@ server_context_worker_thread(void *arg)
          mtx_unlock(&state->renderer_mutex);
 
          if (!ok || res_fd < 0) {
+            /* The client always reads an fd count after the reply (see
+             * proxy_context_get_blob); omitting it would desynchronise the
+             * stream and block the client forever.
+             */
             reply.fd_type = VIRGL_RESOURCE_FD_INVALID;
-            server_send_reply(w->socket_fd, &reply, sizeof(reply));
+            server_send_reply_with_fds(w->socket_fd, &reply, sizeof(reply), NULL, 0);
          } else {
             server_send_reply_with_fds(w->socket_fd, &reply, sizeof(reply),
                                        &res_fd, 1);
@@ -426,16 +426,17 @@ server_context_worker_thread(void *arg)
       }
 
       case RENDER_CONTEXT_OP_IMPORT_RESOURCE: {
-         struct {
-            uint32_t res_id;
-            enum virgl_resource_fd_type fd_type;
-            uint64_t size;
-         } imp_body;
+         /* proxy_context_attach_resource sends the whole request struct,
+          * including the padding in front of the 64-bit size, so read the
+          * rest of it with exactly that layout.
+          */
+         struct render_context_op_import_resource_request req;
+         req.header = hdr;
 
          int fds[1];
          int fd_count;
-         if (!server_recv_with_fds(w->socket_fd, &imp_body, sizeof(imp_body),
-                                   fds, 1, &fd_count))
+         if (!server_recv_with_fds(w->socket_fd, (char *)&req + sizeof(req.header),
+                                   sizeof(req) - sizeof(req.header), fds, 1, &fd_count))
             goto done;
 
          if (fd_count != 1) {
@@ -444,9 +445,15 @@ server_context_worker_thread(void *arg)
          }
 
          mtx_lock(&state->renderer_mutex);
-         vkr_renderer_import_resource(w->ctx_id, imp_body.res_id,
-                                      imp_body.fd_type, fds[0], imp_body.size);
+         const bool imported = vkr_renderer_import_resource(w->ctx_id, req.res_id,
+                                                            req.fd_type, fds[0], req.size);
          mtx_unlock(&state->renderer_mutex);
+
+         /* The worker owns the received duplicate.  vkr keeps it for dma-buf and
+          * opaque imports; shm imports are mapped and do not keep the fd.
+          */
+         if (!imported || req.fd_type == VIRGL_RESOURCE_FD_SHM)
+            os_close_fd(fds[0]);
          break;
       }
 
@@ -488,16 +495,44 @@ done:
    return 0;
 }
 
+/*
+ * Stop and free a worker that has already been unlinked from state->workers.
+ *
+ * This must be called without holding workers_mutex: the exiting worker
+ * destroys its vkr context, which joins vkr threads that may be blocked on
+ * workers_mutex in server_retire_fence_cb.  Joining the worker while holding
+ * the mutex would deadlock.  Once unlinked, server_retire_fence_cb can no
+ * longer find the worker, so its fence eventfd can be closed safely.
+ */
 static void
-server_destroy_worker(struct server_thread_state *state,
-                      struct server_context_worker *w)
+server_destroy_worker(struct server_context_worker *w)
 {
    /* Close our end; worker thread will exit when recv fails */
    closesocket((SOCKET)w->socket_fd);
    thrd_join(w->thread, NULL);
 
-   list_del(&w->head);
+   /* fds received with RENDER_CONTEXT_OP_INIT are owned by the worker */
+   if (w->shmem_fd >= 0)
+      os_close_fd(w->shmem_fd);
+   if (w->fence_eventfd >= 0)
+      os_close_fd(w->fence_eventfd);
+
    free(w);
+}
+
+/* Unlink all workers under workers_mutex, then stop them without it. */
+static void
+server_destroy_all_workers(struct server_thread_state *state)
+{
+   struct list_head workers;
+
+   mtx_lock(&state->workers_mutex);
+   list_replace(&state->workers, &workers);
+   list_inithead(&state->workers);
+   mtx_unlock(&state->workers_mutex);
+
+   list_for_each_entry_safe(struct server_context_worker, w, &workers, head)
+      server_destroy_worker(w);
 }
 
 /*
@@ -593,17 +628,16 @@ server_main_thread(void *arg)
          mtx_lock(&state->workers_mutex);
          struct server_context_worker *w = server_find_worker(state, ctx_id);
          if (w)
-            server_destroy_worker(state, w);
+            list_del(&w->head);
          mtx_unlock(&state->workers_mutex);
+
+         if (w)
+            server_destroy_worker(w);
          break;
       }
 
       case RENDER_CLIENT_OP_RESET: {
-         mtx_lock(&state->workers_mutex);
-         list_for_each_entry_safe(struct server_context_worker, w,
-                                  &state->workers, head)
-            server_destroy_worker(state, w);
-         mtx_unlock(&state->workers_mutex);
+         server_destroy_all_workers(state);
          break;
       }
 
@@ -620,14 +654,14 @@ done:
    proxy_log("server thread: exiting");
 
    /* Clean up remaining workers */
-   mtx_lock(&state->workers_mutex);
-   list_for_each_entry_safe(struct server_context_worker, w,
-                            &state->workers, head)
-      server_destroy_worker(state, w);
-   mtx_unlock(&state->workers_mutex);
+   server_destroy_all_workers(state);
 
    if (state->vkr_initialized)
       vkr_renderer_fini();
+
+   /* no vkr threads are left that could call server_retire_fence_cb */
+   if (g_server_state == state)
+      g_server_state = NULL;
 
    closesocket((SOCKET)state->socket_fd);
    mtx_destroy(&state->renderer_mutex);

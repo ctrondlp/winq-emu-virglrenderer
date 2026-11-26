@@ -12,6 +12,8 @@
 #include <ws2tcpip.h>
 #include <io.h>
 
+#include "util/os_file.h"
+
 #define close closesocket
 #define PROXY_SOCKET_MAX_FD_COUNT 8
 
@@ -24,17 +26,42 @@
  *
  * Protocol for messages with fds:
  *   [uint32_t data_len][data bytes][uint32_t fd_count][int fds...]
+ *
+ * The loopback listener is reachable by every process on the machine, not
+ * just this one.  To keep other processes from taking our place, the
+ * listener is bound with SO_EXCLUSIVEADDRUSE and only the connection whose
+ * source address equals our own client socket is accepted.  Any other
+ * connection is closed without reading from it.
  */
+
+/* Upper bound on foreign connections dropped before giving up. */
+#define PROXY_SOCKET_MAX_ACCEPT_ATTEMPTS 8
+
+static bool
+proxy_socket_same_addr(const struct sockaddr_in *a, const struct sockaddr_in *b)
+{
+   return a->sin_family == b->sin_family && a->sin_port == b->sin_port &&
+          a->sin_addr.s_addr == b->sin_addr.s_addr;
+}
 
 bool
 proxy_socket_pair(int out_fds[static 2])
 {
    WSADATA wsa;
-   WSAStartup(MAKEWORD(2, 2), &wsa);
+   if (WSAStartup(MAKEWORD(2, 2), &wsa))
+      return false;
 
    SOCKET listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
    if (listener == INVALID_SOCKET)
       return false;
+
+   /* no other socket may bind (and steal) the same address and port */
+   const BOOL exclusive = TRUE;
+   if (setsockopt(listener, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char *)&exclusive,
+                  sizeof(exclusive))) {
+      closesocket(listener);
+      return false;
+   }
 
    struct sockaddr_in addr = {
       .sin_family = AF_INET,
@@ -49,7 +76,10 @@ proxy_socket_pair(int out_fds[static 2])
    }
 
    int addrlen = sizeof(addr);
-   getsockname(listener, (struct sockaddr *)&addr, &addrlen);
+   if (getsockname(listener, (struct sockaddr *)&addr, &addrlen)) {
+      closesocket(listener);
+      return false;
+   }
 
    SOCKET client = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
    if (client == INVALID_SOCKET) {
@@ -63,7 +93,33 @@ proxy_socket_pair(int out_fds[static 2])
       return false;
    }
 
-   SOCKET server = accept(listener, NULL, NULL);
+   /* the source address of our own connection, used to authenticate the peer */
+   struct sockaddr_in client_addr;
+   int client_addrlen = sizeof(client_addr);
+   if (getsockname(client, (struct sockaddr *)&client_addr, &client_addrlen) ||
+       client_addrlen != sizeof(client_addr)) {
+      closesocket(client);
+      closesocket(listener);
+      return false;
+   }
+
+   SOCKET server = INVALID_SOCKET;
+   for (int attempt = 0; attempt < PROXY_SOCKET_MAX_ACCEPT_ATTEMPTS; attempt++) {
+      struct sockaddr_in peer_addr;
+      int peer_addrlen = sizeof(peer_addr);
+      SOCKET s = accept(listener, (struct sockaddr *)&peer_addr, &peer_addrlen);
+      if (s == INVALID_SOCKET)
+         break;
+
+      if (peer_addrlen == sizeof(peer_addr) &&
+          proxy_socket_same_addr(&peer_addr, &client_addr)) {
+         server = s;
+         break;
+      }
+
+      proxy_log("dropping a foreign connection to the proxy socket");
+      closesocket(s);
+   }
    closesocket(listener);
 
    if (server == INVALID_SOCKET) {
@@ -98,6 +154,13 @@ void
 proxy_socket_fini(struct proxy_socket *socket)
 {
    closesocket((SOCKET)socket->fd);
+}
+
+void
+proxy_socket_close_fd(int fd)
+{
+   /* a SOCKET, not a CRT fd: close() would hit the CRT invalid parameter path */
+   closesocket((SOCKET)fd);
 }
 
 bool
@@ -191,17 +254,35 @@ proxy_socket_send_request_with_fds(struct proxy_socket *socket,
                                    const int *fds,
                                    int fd_count)
 {
-   if (!send_all((SOCKET)socket->fd, data, size))
+   /* fds are sent inline because the threads share one fd/handle table, but
+    * with SCM_RIGHTS semantics: the receiver gets its own duplicates and
+    * owns them, while the caller keeps (and later closes) its originals.
+    * Sending the caller's own fd numbers would let both sides close the same
+    * handle, or let the receiver use it after the caller closed it and the
+    * value was reused.
+    */
+   if (fd_count < 0 || fd_count > PROXY_SOCKET_MAX_FD_COUNT)
       return false;
 
-   /* Send fds inline (threads share fd table, no SCM_RIGHTS needed) */
-   uint32_t count = (uint32_t)fd_count;
-   if (!send_all((SOCKET)socket->fd, &count, sizeof(count)))
-      return false;
-
-   if (fd_count > 0) {
-      if (!send_all((SOCKET)socket->fd, fds, sizeof(int) * fd_count))
+   int dup_fds[PROXY_SOCKET_MAX_FD_COUNT];
+   for (int i = 0; i < fd_count; i++) {
+      dup_fds[i] = os_dupfd_cloexec(fds[i]);
+      if (dup_fds[i] < 0) {
+         while (i--)
+            os_close_fd(dup_fds[i]);
          return false;
+      }
+   }
+
+   const uint32_t count = (uint32_t)fd_count;
+   if (!send_all((SOCKET)socket->fd, data, size) ||
+       !send_all((SOCKET)socket->fd, &count, sizeof(count)) ||
+       (fd_count > 0 &&
+        !send_all((SOCKET)socket->fd, dup_fds, sizeof(int) * fd_count))) {
+      /* the receiver only takes the fds after reading the whole message */
+      for (int i = 0; i < fd_count; i++)
+         os_close_fd(dup_fds[i]);
+      return false;
    }
 
    return true;
@@ -270,6 +351,12 @@ void
 proxy_socket_fini(struct proxy_socket *socket)
 {
    close(socket->fd);
+}
+
+void
+proxy_socket_close_fd(int fd)
+{
+   close(fd);
 }
 
 bool

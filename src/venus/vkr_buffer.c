@@ -119,6 +119,10 @@ vkr_dispatch_vkGetBufferMemoryRequirements(
 
    vn_replace_vkGetBufferMemoryRequirements_args_handle(args);
    vk->GetBufferMemoryRequirements(args->device, args->buffer, args->pMemoryRequirements);
+   if (args->pMemoryRequirements)
+      args->pMemoryRequirements->memoryTypeBits = vkr_physical_device_remap_memory_type_bits(dev->physical_device,
+                                                      args->pMemoryRequirements->memoryTypeBits,
+                                                      false);
 }
 
 static void
@@ -131,6 +135,10 @@ vkr_dispatch_vkGetBufferMemoryRequirements2(
 
    vn_replace_vkGetBufferMemoryRequirements2_args_handle(args);
    vk->GetBufferMemoryRequirements2(args->device, args->pInfo, args->pMemoryRequirements);
+   if (args->pMemoryRequirements)
+      args->pMemoryRequirements->memoryRequirements.memoryTypeBits = vkr_physical_device_remap_memory_type_bits(dev->physical_device,
+                                                      args->pMemoryRequirements->memoryRequirements.memoryTypeBits,
+                                                      false);
 }
 
 static void
@@ -204,6 +212,10 @@ vkr_dispatch_vkGetDeviceBufferMemoryRequirements(
    vn_replace_vkGetDeviceBufferMemoryRequirements_args_handle(args);
    vk->GetDeviceBufferMemoryRequirements(args->device, args->pInfo,
                                          args->pMemoryRequirements);
+   if (args->pMemoryRequirements)
+      args->pMemoryRequirements->memoryRequirements.memoryTypeBits = vkr_physical_device_remap_memory_type_bits(dev->physical_device,
+                                                      args->pMemoryRequirements->memoryRequirements.memoryTypeBits,
+                                                      false);
 }
 
 void

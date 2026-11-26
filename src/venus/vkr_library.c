@@ -46,7 +46,11 @@ vkr_library_load(struct vulkan_library *lib)
       return true;
 
 #ifdef _WIN32
-   lib->handle = LoadLibraryA("vulkan-1.dll");
+   /* Only take the Vulkan loader from System32 (installed by the GPU driver
+    * or the Vulkan runtime), never from the application directory, the
+    * current directory or PATH, where a planted copy could be picked up.
+    */
+   lib->handle = LoadLibraryExA("vulkan-1.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
    if (lib->handle == NULL) {
       vkr_log("failed to open vulkan-1.dll: error %lu", GetLastError());
       return false;

@@ -54,6 +54,10 @@
 #include "vrend_debug.h"
 #include "vrend_winsys.h"
 #include "vrend_blitter.h"
+#include "vrend_winq_share.h"
+#ifdef _WIN32
+#include <vulkan/vulkan_core.h>
+#endif
 
 #include "virgl_util.h"
 
@@ -7466,7 +7470,7 @@ static void vrend_renderer_use_threaded_sync(void)
 
    vrend_state.sync_thread = u_thread_create(thread_sync, NULL);
    if (!vrend_state.sync_thread) {
-      close(vrend_state.eventfd);
+      os_close_fd(vrend_state.eventfd); /* winq: a handle token on Windows, not a CRT descriptor */
       vrend_state.eventfd = -1;
       vrend_clicbs->destroy_gl_context_surfaceless(vrend_state.sync_context);
       cnd_destroy(&vrend_state.fence_cond);
@@ -7526,10 +7530,40 @@ static void vrend_pipe_resource_detach_iov(struct pipe_resource *pres,
    res->num_iovs = 0;
 }
 
+#ifdef _WIN32
+/* winq: the size of the Vulkan memory behind a shared texture, 0 if the resource has none. */
+uint64_t vrend_renderer_winq_share_size(struct pipe_resource *pres, uint32_t *mem_type, void **handle)
+{
+   struct vrend_resource *res = (struct vrend_resource *)pres;
+   if (!res || !res->winq_share_handle)
+      return 0;
+   *mem_type = res->winq_share_mem_type;
+   *handle = res->winq_share_handle;
+   return res->winq_share_size;
+}
+#endif
+
 static enum virgl_resource_fd_type vrend_pipe_resource_export_fd(UNUSED struct pipe_resource *pres,
                                                                  UNUSED int *fd,
                                                                  UNUSED void *data)
 {
+#ifdef _WIN32
+   /* winq: a texture with Vulkan memory is exported as that memory's handle. */
+   {
+      struct vrend_resource *wres = (struct vrend_resource *)pres;
+      if (wres->winq_share_handle) {
+         HANDLE dup_handle = NULL;
+         if (DuplicateHandle(GetCurrentProcess(), (HANDLE)wres->winq_share_handle, GetCurrentProcess(),
+                             &dup_handle, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+            *fd = os_wrap_win32_handle(dup_handle);
+            if (*fd >= 0)
+               return VIRGL_RESOURCE_FD_OPAQUE;
+            CloseHandle(dup_handle);
+         }
+         return VIRGL_RESOURCE_FD_INVALID;
+      }
+   }
+#endif
 #if defined(HAVE_EPOXY_EGL_H) && defined(ENABLE_GBM_ALLOCATION)
    struct vrend_resource *res = (struct vrend_resource *)pres;
 
@@ -7819,7 +7853,7 @@ vrend_renderer_fini(void)
    vrend_state.finishing = true;
 
    if (vrend_state.eventfd != -1) {
-      close(vrend_state.eventfd);
+      os_close_fd(vrend_state.eventfd); /* winq: a handle token on Windows, not a CRT descriptor */
       vrend_state.eventfd = -1;
    }
 
@@ -8691,6 +8725,75 @@ static void vrend_resource_gbm_init(struct vrend_resource *gr, uint32_t format)
 #endif
 }
 
+#ifdef _WIN32
+/*
+ * winq: gives a texture the guest may share with its Vulkan programs (a window or screen buffer)
+ * storage that a Venus context can import, see vrend_winq_share.c.  The texture is bound.
+ * Returns false if the texture is not of that kind or anything fails; it has no storage then.
+ */
+static bool vrend_winq_shared_storage(struct vrend_resource *gr, GLenum internalformat)
+{
+   struct pipe_resource *pr = &gr->base;
+   uint32_t vk_format;
+
+   if (!(pr->bind & (VIRGL_BIND_SHARED | VIRGL_BIND_SCANOUT)))
+      return false;
+   if (gr->target != GL_TEXTURE_2D || pr->last_level != 0 || pr->nr_samples > 1 ||
+       pr->depth0 != 1 || pr->array_size != 1)
+      return false;
+   if (!has_feature(feat_memory_object) || !has_feature(feat_memory_object_win32))
+      return false;
+   switch (internalformat) {
+   case GL_RGBA8:
+      vk_format = VK_FORMAT_R8G8B8A8_UNORM;
+      break;
+   default:
+      return false;
+   }
+
+   GLubyte luid[8] = { 0 };
+   for (int i = 0; i < 64 && glGetError() != GL_NO_ERROR; i++)
+      ;
+   glGetUnsignedBytevEXT(GL_DEVICE_LUID_EXT, luid);
+   const bool luid_valid = glGetError() == GL_NO_ERROR;
+
+   void *handle = NULL;
+   uint64_t size = 0;
+   uint32_t mem_type = 0;
+   if (!vrend_winq_share_alloc(luid, luid_valid, pr->width0, pr->height0, vk_format, &handle, &size, &mem_type)) {
+      winq_dbg("GLSHARE alloc failed (luid valid %d)", (int)luid_valid);
+      return false;
+   }
+
+   /* The import does not take the handle over; it is kept for the Venus side and closed with the resource. */
+   GLuint memobj = 0;
+   glCreateMemoryObjectsEXT(1, &memobj);
+   glImportMemoryWin32HandleEXT(memobj, size, GL_HANDLE_TYPE_OPAQUE_WIN32_EXT, handle);
+   /* glGetError clears the error it returns, so keep the import's. */
+   GLenum winq_err = glGetError();
+   if (winq_err == GL_NO_ERROR) {
+      glTexStorageMem2DEXT(gr->target, 1, internalformat, pr->width0, pr->height0, memobj, 0);
+      winq_err = glGetError();
+   }
+   winq_dbg("GLSHARE %ux%u format %d: %llu bytes, handle %p, GL error 0x%x", pr->width0, pr->height0, (int)pr->format,
+            (unsigned long long)size, handle, winq_err);
+   if (winq_err != GL_NO_ERROR) {
+      glDeleteMemoryObjectsEXT(1, &memobj);
+      vrend_winq_share_close(handle);
+      for (int i = 0; i < 64 && glGetError() != GL_NO_ERROR; i++)
+         ;
+      return false;
+   }
+
+   gr->memobj = memobj;
+   gr->storage_bits |= VREND_STORAGE_GL_MEMOBJ;
+   gr->winq_share_handle = handle;
+   gr->winq_share_size = size;
+   gr->winq_share_mem_type = mem_type;
+   return true;
+}
+#endif /* _WIN32 */
+
 static int vrend_resource_alloc_texture(struct vrend_resource *gr,
                                         enum virgl_formats format,
                                         void *image_oes)
@@ -8842,6 +8945,11 @@ static int vrend_resource_alloc_texture(struct vrend_resource *gr,
             }
          }
       } else {
+#ifdef _WIN32
+         if (format_can_texture_storage && vrend_winq_shared_storage(gr, internalformat)) {
+            /* winq: the storage is Vulkan memory */
+         } else
+#endif
          if (format_can_texture_storage)
             glTexStorage2D(gr->target, pr->last_level + 1, internalformat, pr->width0,
                            gr->target == GL_TEXTURE_1D_ARRAY ? pr->array_size : pr->height0);
@@ -8956,6 +9064,12 @@ void vrend_renderer_resource_destroy(struct vrend_resource *res)
    if (has_bit(res->storage_bits, VREND_STORAGE_GL_MEMOBJ)) {
       glDeleteMemoryObjectsEXT(1, &res->memobj);
    }
+#ifdef _WIN32
+   if (res->winq_share_handle) {
+      vrend_winq_share_close(res->winq_share_handle);
+      res->winq_share_handle = NULL;
+   }
+#endif
 
 #ifdef ENABLE_GBM
    if (res->egl_image) {

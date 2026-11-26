@@ -23,6 +23,136 @@ static inline int getpagesize(void) {
 #include "vkr_device_memory_gen.h"
 #include "vkr_physical_device.h"
 
+#include "vrend/vrend_winq_share.h"
+
+/* What all contexts together have allocated with vkAllocateMemory and the
+ * limit for it (0: none), see vkr_device_memory_set_limit.  The renderer
+ * library lives in one VM process, so this is per VM. */
+static atomic_uint_fast64_t vkr_device_memory_limit = 0;
+static atomic_uint_fast64_t vkr_device_memory_total = 0;
+
+void
+vkr_device_memory_set_limit(uint64_t limit)
+{
+   atomic_store(&vkr_device_memory_limit, limit);
+}
+
+uint64_t
+vkr_device_memory_used(void)
+{
+   return atomic_load(&vkr_device_memory_total);
+}
+
+/* Adds size to the total unless that goes over the limit. */
+static bool
+vkr_device_memory_reserve(uint64_t size)
+{
+   const uint64_t limit = atomic_load(&vkr_device_memory_limit);
+   uint64_t total = atomic_load(&vkr_device_memory_total);
+   do {
+      if (limit && (size > limit || total > limit - size))
+         return false;
+   } while (!atomic_compare_exchange_weak(&vkr_device_memory_total, &total, total + size));
+   return true;
+}
+
+static void
+vkr_device_memory_unreserve(uint64_t size)
+{
+   atomic_fetch_sub(&vkr_device_memory_total, size);
+}
+
+#ifdef _WIN32
+/* winq: see vkr_device_memory.h.  Open addressing by resource id, like the OpenGL share registry in
+ * vrend_winq_share.c; a full table records nothing more, and an import then keeps the guest's type. */
+#define VKR_WINQ_EXPORT_REGISTRY_SIZE 4096 /* a power of two */
+#define VKR_WINQ_EXPORT_DELETED UINT32_MAX
+static struct {
+   uint32_t res_id; /* 0: never used, VKR_WINQ_EXPORT_DELETED: free again */
+   uint32_t mem_type;
+   uint64_t size;
+   uint8_t luid[VK_LUID_SIZE];
+   /* the exporting resource's handle (closed after its entry is cleared): an import only matches the
+    * entry with a handle to the same memory, as the guest can reuse the resource id meanwhile */
+   HANDLE handle;
+} vkr_winq_export_registry[VKR_WINQ_EXPORT_REGISTRY_SIZE];
+static SRWLOCK vkr_winq_export_registry_lock = SRWLOCK_INIT;
+
+/* Returns the slot of res_id, or -1.  The caller holds the lock. */
+static int
+vkr_winq_export_registry_find(uint32_t res_id)
+{
+   uint32_t idx = res_id & (VKR_WINQ_EXPORT_REGISTRY_SIZE - 1);
+   for (uint32_t probes = 0;
+        vkr_winq_export_registry[idx].res_id && probes < VKR_WINQ_EXPORT_REGISTRY_SIZE; probes++) {
+      if (vkr_winq_export_registry[idx].res_id == res_id)
+         return (int)idx;
+      idx = (idx + 1) & (VKR_WINQ_EXPORT_REGISTRY_SIZE - 1);
+   }
+   return -1;
+}
+
+bool
+vkr_winq_export_registry_set(uint32_t res_id, uint32_t mem_type, uint64_t size, const uint8_t *luid, void *handle)
+{
+   if (!res_id || res_id == VKR_WINQ_EXPORT_DELETED || !luid || !handle || handle == INVALID_HANDLE_VALUE)
+      return false;
+   AcquireSRWLockExclusive(&vkr_winq_export_registry_lock);
+   int slot = vkr_winq_export_registry_find(res_id);
+   if (slot < 0) {
+      uint32_t idx = res_id & (VKR_WINQ_EXPORT_REGISTRY_SIZE - 1);
+      for (uint32_t probes = 0; probes < VKR_WINQ_EXPORT_REGISTRY_SIZE; probes++) {
+         if (!vkr_winq_export_registry[idx].res_id ||
+             vkr_winq_export_registry[idx].res_id == VKR_WINQ_EXPORT_DELETED) {
+            slot = (int)idx;
+            break;
+         }
+         idx = (idx + 1) & (VKR_WINQ_EXPORT_REGISTRY_SIZE - 1);
+      }
+   }
+   if (slot >= 0) {
+      vkr_winq_export_registry[slot].res_id = res_id;
+      vkr_winq_export_registry[slot].mem_type = mem_type;
+      vkr_winq_export_registry[slot].size = size;
+      memcpy(vkr_winq_export_registry[slot].luid, luid, VK_LUID_SIZE);
+      vkr_winq_export_registry[slot].handle = (HANDLE)handle;
+   }
+   ReleaseSRWLockExclusive(&vkr_winq_export_registry_lock);
+   return slot >= 0;
+}
+
+bool
+vkr_winq_export_registry_get(uint32_t res_id, void *handle, uint32_t *out_mem_type, uint64_t *out_size,
+                             uint8_t *out_luid)
+{
+   bool found = false;
+   if (!res_id || res_id == VKR_WINQ_EXPORT_DELETED)
+      return false;
+   AcquireSRWLockShared(&vkr_winq_export_registry_lock);
+   const int slot = vkr_winq_export_registry_find(res_id);
+   if (slot >= 0 && vrend_winq_share_same_object(vkr_winq_export_registry[slot].handle, handle)) {
+      *out_mem_type = vkr_winq_export_registry[slot].mem_type;
+      *out_size = vkr_winq_export_registry[slot].size;
+      memcpy(out_luid, vkr_winq_export_registry[slot].luid, VK_LUID_SIZE);
+      found = true;
+   }
+   ReleaseSRWLockShared(&vkr_winq_export_registry_lock);
+   return found;
+}
+
+void
+vkr_winq_export_registry_clear(uint32_t res_id)
+{
+   if (!res_id || res_id == VKR_WINQ_EXPORT_DELETED)
+      return;
+   AcquireSRWLockExclusive(&vkr_winq_export_registry_lock);
+   const int slot = vkr_winq_export_registry_find(res_id);
+   if (slot >= 0)
+      vkr_winq_export_registry[slot].res_id = VKR_WINQ_EXPORT_DELETED;
+   ReleaseSRWLockExclusive(&vkr_winq_export_registry_lock);
+}
+#endif /* _WIN32 */
+
 static bool
 vkr_get_fd_info_from_resource_info(struct vkr_context *ctx,
                                    struct vkr_device *dev,
@@ -56,6 +186,8 @@ vkr_get_fd_info_from_resource_info(struct vkr_context *ctx,
          if (handle == INVALID_HANDLE_VALUE ||
              !DuplicateHandle(GetCurrentProcess(), handle, GetCurrentProcess(), &dup_handle,
                               0, FALSE, DUPLICATE_SAME_ACCESS)) {
+            winq_dbg("ImportFail res=%u fd_type=%d handle=%p err=%lu", res_info->resourceId, (int)res->fd_type,
+                     (void *)handle, (unsigned long)GetLastError());
             return false;
          }
 
@@ -80,6 +212,8 @@ vkr_get_fd_info_from_resource_info(struct vkr_context *ctx,
          if (handle == INVALID_HANDLE_VALUE ||
              !DuplicateHandle(GetCurrentProcess(), handle, GetCurrentProcess(), &dup_handle,
                               0, FALSE, DUPLICATE_SAME_ACCESS)) {
+            winq_dbg("ImportFail res=%u fd_type=%d handle=%p err=%lu", res_info->resourceId, (int)res->fd_type,
+                     (void *)handle, (unsigned long)GetLastError());
             return false;
          }
 
@@ -323,6 +457,12 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
       args->ret = VK_ERROR_UNKNOWN;
       return;
    }
+   /* The host type that really backs the guest type (differs only for a device local + host
+    * visible type that is backed by system memory). */
+   const uint32_t host_mem_type_index = physical_dev->memory_type_redirect[mem_type_index];
+   winq_dbg("AllocReq size=%llu guest_type=%u host_type=%u", (unsigned long long)alloc_info->allocationSize,
+            mem_type_index, host_mem_type_index);
+   alloc_info->memoryTypeIndex = host_mem_type_index;
 
    /* translate VkImportMemoryResourceInfoMESA into VkImportMemoryFdInfoKHR in place */
    VkImportMemoryFdInfoKHR local_import_info = { .fd = -1 };
@@ -333,24 +473,100 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
 #endif
    const void *import_info = NULL;
    VkImportMemoryResourceInfoMESA *res_info = NULL;
+   bool winq_gl_import = false;
    VkBaseInStructure *prev_of_res_info = vkr_find_prev_struct(
       alloc_info, VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA);
    if (prev_of_res_info) {
       res_info = (VkImportMemoryResourceInfoMESA *)prev_of_res_info->pNext;
+#ifdef _WIN32
+      {
+         /* winq: the memory of an OpenGL texture only means something on the adapter it was allocated on,
+          * and its memory type is an index into that adapter's types. */
+         const struct vkr_resource *winq_chk = vkr_context_get_resource(ctx, res_info->resourceId);
+         uint8_t winq_luid[VK_LUID_SIZE];
+         if (winq_chk && winq_chk->winq_gl &&
+             (winq_chk->winq_gl_mem_type >= physical_dev->memory_properties.memoryTypeCount ||
+              !vrend_winq_share_luid(winq_luid) || !physical_dev->id_properties.deviceLUIDValid ||
+              memcmp(winq_luid, physical_dev->id_properties.deviceLUID, VK_LUID_SIZE))) {
+            winq_dbg("GLIMPORT res=%u refused: another adapter or a bad memory type", res_info->resourceId);
+            args->ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
+            return;
+         }
+      }
+#endif
       if (!vkr_get_fd_info_from_resource_info(ctx, dev, res_info, &local_import_info,
 #ifdef _WIN32
                                               &local_import_win32_info,
 #endif
                                               &import_info)) {
+         const struct vkr_resource *refused = vkr_context_get_resource(ctx, res_info->resourceId);
+         winq_dbg("ImportRefused res=%u size=%llu found=%d fd_type=%d", res_info->resourceId,
+                  (unsigned long long)alloc_info->allocationSize, refused ? 1 : 0, refused ? (int)refused->fd_type : -1);
          args->ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
          return;
       }
 
       prev_of_res_info->pNext = import_info;
+#ifdef _WIN32
+      /* winq: the memory behind the handle was allocated in whole pages (see below); an import of
+       * another size is not the same allocation, so ask for the size the memory really has. */
+      alloc_info->allocationSize = align(alloc_info->allocationSize, getpagesize());
+
+      /* winq: memory of an OpenGL texture must be imported with the type and size it was allocated
+       * with, whatever the guest worked out from the image it wants to bind to it. */
+      struct vkr_resource *winq_res = vkr_context_get_resource(ctx, res_info->resourceId);
+      if (winq_res && winq_res->winq_gl) {
+         winq_gl_import = true;
+         alloc_info->memoryTypeIndex = winq_res->winq_gl_mem_type;
+         alloc_info->allocationSize = winq_res->size;
+         /* The memory is not a dedicated allocation of the image the guest names (which is replaced when
+          * it is bound, see vkr_image.c): the host driver would tie the two together. */
+         VkBaseInStructure *prev_of_dedicated =
+            vkr_find_prev_struct(alloc_info, VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO);
+         if (prev_of_dedicated)
+            prev_of_dedicated->pNext = prev_of_dedicated->pNext->pNext;
+         winq_dbg("GLIMPORT res=%u size=%llu type=%u dedicated=%d", res_info->resourceId,
+                  (unsigned long long)alloc_info->allocationSize, alloc_info->memoryTypeIndex,
+                  prev_of_dedicated != NULL);
+      } else if (winq_res) {
+         /* winq: memory another Venus context exported (a swapchain image that gamescope shows, for
+          * example) is imported through its opaque Win32 handle, and such an import must use the
+          * memory type and size the memory was allocated with.  The guest picks the type from the
+          * image it binds; with another type the host driver may fail the import (seen as
+          * VK_ERROR_OUT_OF_DEVICE_MEMORY), and the guest's next use of the missing memory then
+          * ends its context. */
+         uint32_t exp_type;
+         uint64_t exp_size;
+         uint8_t exp_luid[VK_LUID_SIZE];
+         if ((winq_res->fd_type == VIRGL_RESOURCE_FD_DMABUF || winq_res->fd_type == VIRGL_RESOURCE_FD_OPAQUE) &&
+             vkr_winq_export_registry_get(res_info->resourceId, os_get_win32_handle_from_fd(winq_res->u.fd),
+                                          &exp_type, &exp_size, exp_luid) &&
+             exp_type < physical_dev->memory_properties.memoryTypeCount &&
+             physical_dev->id_properties.deviceLUIDValid &&
+             !memcmp(exp_luid, physical_dev->id_properties.deviceLUID, VK_LUID_SIZE)) {
+            winq_dbg("VKIMPORT res=%u type %u->%u size %llu->%llu", res_info->resourceId,
+                     alloc_info->memoryTypeIndex, exp_type,
+                     (unsigned long long)alloc_info->allocationSize, (unsigned long long)exp_size);
+            alloc_info->memoryTypeIndex = exp_type;
+            alloc_info->allocationSize = exp_size;
+         }
+      }
+#endif
    }
 
    VkExportMemoryAllocateInfo *export_info =
       vkr_find_struct(alloc_info->pNext, VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO);
+#ifdef _WIN32
+   /* winq: an allocation that imports a handle must not also ask for a new export; the host driver then
+    * gives the guest an allocation of its own that does not alias the imported memory.  So the memory
+    * is not exportable either. */
+   if (res_info && export_info) {
+      VkBaseInStructure *prev_of_export = vkr_find_prev_struct(alloc_info, VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO);
+      if (prev_of_export)
+         prev_of_export->pNext = export_info->pNext;
+      export_info = NULL;
+   }
+#endif
 
    /* track if driver has requested export allocation */
    const bool might_export = export_info && export_info->handleTypes;
@@ -379,8 +595,18 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
        * dma_buf fd export support, we must use gbm bo import path instead of forcing
        * opaque fd export. e.g. the client driver uses external memory for wsi image.
        */
+#ifdef _WIN32
+      /* winq: the host cannot export dma-buf and there is no gbm; the dma-buf shim stands in for it
+       * (DMA_BUF is just the opaque Win32 handle, see below), so a guest request to export host visible
+       * memory as dma-buf (gamescope's scanout images) is served by the opaque path instead of the gbm
+       * import path, which is not built and fails the allocation.  The memory is then exported to the
+       * guest as an opaque resource, which the proxy accepts on Windows. */
+      const bool dma_buf_via_opaque = physical_dev->dma_buf_shim_active;
+#else
+      const bool dma_buf_via_opaque = false;
+#endif
       const bool no_dma_buf_export =
-         !export_info ||
+         !export_info || dma_buf_via_opaque ||
          !(export_info->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT);
       const bool force_gbm_import = !!physical_dev->gbm_device;
       const bool force_udmabuf_import = physical_dev->udmabuf_dev_fd >= 0;
@@ -451,13 +677,22 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
             args->ret = vkr_gbm_get_fd_info_from_allocation_info(
                physical_dev, alloc_info, &gbm_bo, &local_import_info);
          }
-         if (args->ret != VK_SUCCESS)
+         if (args->ret != VK_SUCCESS) {
+            winq_dbg("ALLOCEXIT dmabuf-force ret=%d size=%llu", (int)args->ret,
+                     (unsigned long long)alloc_info->allocationSize);
             return;
+         }
 
          alloc_info->pNext = &local_import_info;
          valid_fd_types = 1 << VIRGL_RESOURCE_FD_DMABUF;
       }
    }
+
+   /* winq: the guest maps an exportable host visible allocation in whole pages (and the device refuses a
+    * mapping that is not), so round the size up like the path above does for a forced export; the
+    * guest's own export info (for example its cursor and scanout buffers) takes this path too. */
+   if (!res_info && export_info)
+      alloc_info->allocationSize = align(alloc_info->allocationSize, getpagesize());
 
    if (!guest_export_handle_types && export_info)
       guest_export_handle_types = export_info->handleTypes;
@@ -489,8 +724,33 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
    }
 #endif
 
+   /* What is allocated here counts against the host memory limit.  An import
+    * only wraps memory that exists already. */
+   const bool counted = !res_info;
+   if (counted && !vkr_device_memory_reserve(alloc_info->allocationSize)) {
+      vkr_log("vkAllocateMemory of %llu bytes refused: over the host memory limit (%llu bytes in use)",
+              (unsigned long long)alloc_info->allocationSize,
+              (unsigned long long)vkr_device_memory_used());
+      if (local_import_info.fd >= 0)
+         os_close_fd(local_import_info.fd);
+#ifdef _WIN32
+      if (local_import_win32_info.handle &&
+          local_import_win32_info.handle != INVALID_HANDLE_VALUE)
+         CloseHandle(local_import_win32_info.handle);
+#endif
+      if (gbm_bo)
+         vkr_gbm_bo_destroy(gbm_bo);
+      args->ret = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+      return;
+   }
+
    struct vkr_device_memory *mem = vkr_device_memory_create_and_add(ctx, args);
+   winq_dbg("AllocMem ret=%d size=%llu type=%u(guest %u) props=0x%x export=%d res_info=%d used=%llu", (int)args->ret,
+            (unsigned long long)alloc_info->allocationSize, host_mem_type_index, mem_type_index, (unsigned)property_flags,
+            export_info ? 1 : 0, res_info ? 1 : 0, (unsigned long long)vkr_device_memory_used());
    if (!mem) {
+      if (counted)
+         vkr_device_memory_unreserve(alloc_info->allocationSize);
       if (local_import_info.fd >= 0)
          os_close_fd(local_import_info.fd);
 #ifdef _WIN32
@@ -503,6 +763,15 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
       return;
    }
 
+#ifdef _WIN32
+   /* Unlike fd imports, importing an NT handle does not transfer its
+    * ownership to the driver; close our duplicate now that the import worked.
+    */
+   if (local_import_win32_info.handle &&
+       local_import_win32_info.handle != INVALID_HANDLE_VALUE)
+      CloseHandle(local_import_win32_info.handle);
+#endif
+
    mem->device = dev;
    mem->might_export = might_export;
    mem->property_flags = property_flags;
@@ -510,7 +779,11 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
    mem->udmabuf_fd = udmabuf_fd;
    mem->gbm_bo = gbm_bo;
    mem->allocation_size = alloc_info->allocationSize;
-   mem->memory_type_index = mem_type_index;
+   /* the host type the memory really has (an import can take another type than the guest asked for) */
+   mem->memory_type_index = alloc_info->memoryTypeIndex;
+   mem->counted = counted;
+   mem->winq_gl = winq_gl_import;
+   mem->winq_gl_mem_type = winq_gl_import ? alloc_info->memoryTypeIndex : 0;
 }
 
 static void
@@ -602,12 +875,17 @@ vkr_dispatch_vkGetMemoryResourcePropertiesMESA(
       args->ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
       return;
    }
+   /* winq: the types as the guest sees them, see vkr_physical_device_remap_memory_type_bits */
+   args->pMemoryResourceProperties->memoryTypeBits = vkr_physical_device_remap_memory_type_bits(
+      dev->physical_device, args->pMemoryResourceProperties->memoryTypeBits, false);
 
    VkMemoryResourceAllocationSizePropertiesMESA *alloc_size_props =
       vkr_find_struct(args->pMemoryResourceProperties->pNext,
                       VK_STRUCTURE_TYPE_MEMORY_RESOURCE_ALLOCATION_SIZE_PROPERTIES_MESA);
    if (alloc_size_props)
       alloc_size_props->allocationSize = res->size;
+   winq_dbg("MEMRES res=%u size=%llu bits=0x%x ret=%d type=%d", args->resourceId, (unsigned long long)res->size,
+            args->pMemoryResourceProperties->memoryTypeBits, (int)args->ret, (int)res->fd_type);
 }
 
 void
@@ -633,6 +911,10 @@ vkr_context_init_device_memory_dispatch(struct vkr_context *ctx)
 void
 vkr_device_memory_release(struct vkr_device_memory *mem)
 {
+   if (mem->counted) {
+      mem->counted = false;
+      vkr_device_memory_unreserve(mem->allocation_size);
+   }
    if (mem->gbm_bo)
       vkr_gbm_bo_destroy(mem->gbm_bo);
    if (mem->udmabuf_fd >= 0)

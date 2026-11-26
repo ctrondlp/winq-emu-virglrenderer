@@ -178,4 +178,13 @@ void trace_end(void **scope);
 /* Utility to name a dmabuf using DMA_BUF_SET_NAME_B. */
 void set_dmabuf_name(int fd, const char *name);
 
+/* winq: the diagnostic log, a file named by the environment variable WINQ_DEBUG_LOG (off when unset).
+ * winq_dbg appends one line to it. */
+#include <stdarg.h>
+bool winq_dbg_enabled(void);
+void winq_dbg(const char *fmt, ...);
+void winq_dbg_v(const char *fmt, va_list va);
+/* whether WINQ_DEBUG_CMDS is set: also log image barriers, descriptor writes and image views */
+bool winq_dbg_cmds(void);
+
 #endif /* VIRGL_UTIL_H */

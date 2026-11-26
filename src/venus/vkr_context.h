@@ -32,6 +32,15 @@ struct vkr_resource {
    } u;
 
    size_t size;
+
+   /* winq: the resource is an OpenGL (vrend) texture whose storage is Vulkan memory of this type and
+    * of the size above; an image bound to it must have optimal tiling, see vkr_image.c */
+   bool winq_gl;
+   uint32_t winq_gl_mem_type;
+
+   /* winq: this context exported the resource's memory and recorded it with
+    * vkr_winq_export_registry_set(), see vkr_device_memory.h */
+   bool winq_venus_export;
 };
 
 enum vkr_context_validate_level {
@@ -155,10 +164,14 @@ vkr_context_get_resource(struct vkr_context *ctx, uint32_t res_id)
 }
 
 static inline void
-vkr_context_set_fatal(struct vkr_context *ctx)
+vkr_context_set_fatal_at(struct vkr_context *ctx, const char *file, int line)
 {
    ctx->cs_fatal_error = true;
+   /* winq: where a context was stopped; the guest only sees that it was */
+   vkr_log("context %u (%s) set fatal at %s:%d", ctx->ctx_id, ctx->debug_name ? ctx->debug_name : "?", file,
+           line);
 }
+#define vkr_context_set_fatal(ctx) vkr_context_set_fatal_at(ctx, __FILE__, __LINE__)
 
 static inline bool
 vkr_context_get_fatal(struct vkr_context *ctx)

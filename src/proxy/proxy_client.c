@@ -49,14 +49,14 @@ proxy_client_create_context(struct proxy_client *client,
 
    if (reply.ok != fd_count) {
       if (fd_count)
-         close(ctx_fd);
+         proxy_socket_close_fd(ctx_fd);
       return false;
    } else if (!reply.ok) {
       return false;
    }
 
    if (!proxy_socket_is_valid(ctx_fd)) {
-      close(ctx_fd);
+      proxy_socket_close_fd(ctx_fd);
       return false;
    }
 

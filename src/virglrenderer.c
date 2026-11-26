@@ -22,6 +22,7 @@
  *
  **************************************************************************/
 
+#include <stdatomic.h>
 #include <stdio.h>
 #include <time.h>
 
@@ -49,6 +50,7 @@
 #include "proxy/proxy_renderer.h"
 #include "vrend/vrend_renderer.h"
 #include "vrend/vrend_winsys.h"
+#include "vrend/vrend_winq_share.h"
 
 #ifndef WIN32
 #include "util/libsync.h"
@@ -79,6 +81,13 @@ struct global_state {
 };
 
 static struct global_state state;
+
+#ifdef _WIN32
+/* Kept outside of 'state' because virgl_renderer_cleanup clears 'state'
+ * before releasing the timer resolution request.
+ */
+static bool virgl_win32_timer_period_set;
+#endif
 
 /* new API - just wrap internal API for now */
 
@@ -171,6 +180,11 @@ void virgl_renderer_resource_unref(uint32_t res_handle)
 
    if (!res)
       return;
+
+#ifdef _WIN32
+   /* winq: the id may be used again for a resource that is not a shared OpenGL texture */
+   vrend_winq_share_registry_clear(res_handle);
+#endif
 
    args.callback = detach_resource;
    args.data = res;
@@ -291,14 +305,28 @@ void virgl_renderer_context_destroy(uint32_t handle)
    virgl_context_remove(handle);
 }
 
+/* winq: whether to log why a submit failed.  The guest can repeat a failing submit without end, so only
+ * the first failures are logged. */
+static bool virgl_renderer_log_submit_failure(void)
+{
+   static atomic_uint count;
+   const unsigned n = atomic_fetch_add(&count, 1);
+   if (n == 16)
+      virgl_error("further failed submits are not logged\n");
+   return n < 16;
+}
+
 int virgl_renderer_submit_cmd(void *buffer,
                               int ctx_id,
                               int ndw)
 {
    TRACE_FUNC();
    struct virgl_context *ctx = virgl_context_lookup(ctx_id);
-   if (!ctx)
+   if (!ctx) {
+      if (virgl_renderer_log_submit_failure())
+         virgl_error("submit to context %d, which does not exist\n", ctx_id);
       return EINVAL;
+   }
 
    if (ndw < 0 || (unsigned)ndw > UINT32_MAX / sizeof(uint32_t))
       return EINVAL;
@@ -306,7 +334,14 @@ int virgl_renderer_submit_cmd(void *buffer,
    if (((uintptr_t)buffer & 3) != 0)
       return EFAULT;
 
-   return ctx->submit_cmd(ctx, buffer, (uint32_t)ndw * sizeof(uint32_t));
+   const int ret = ctx->submit_cmd(ctx, buffer, (uint32_t)ndw * sizeof(uint32_t));
+   if (ret) {
+      if (virgl_renderer_log_submit_failure())
+         virgl_error("submit of %d dwords to context %d failed: %d (first command 0x%x)\n", ndw, ctx_id, ret,
+                     ndw > 0 ? *(const uint32_t *)buffer : 0);
+      winq_dbg("SUBMITFAIL ctx=%d ndw=%d ret=%d first=0x%x", ctx_id, ndw, ret, ndw > 0 ? *(const uint32_t *)buffer : 0);
+   }
+   return ret;
 }
 
 int virgl_renderer_transfer_write_iov(uint32_t handle,
@@ -767,6 +802,10 @@ void virgl_renderer_poll(void)
 void virgl_renderer_cleanup(UNUSED void *cookie)
 {
    TRACE_FUNC();
+#ifdef _WIN32
+   /* winq: all resources go, without virgl_renderer_resource_unref */
+   vrend_winq_share_registry_reset();
+#endif
    if (state.vrend_initialized)
       vrend_renderer_prepare_reset();
 
@@ -795,6 +834,14 @@ void virgl_renderer_cleanup(UNUSED void *cookie)
    vkr_allocator_fini();
 
    memset(&state, 0, sizeof(state));
+
+#ifdef _WIN32
+   /* undo the timeBeginPeriod(1) of virgl_renderer_init */
+   if (virgl_win32_timer_period_set) {
+      timeEndPeriod(1);
+      virgl_win32_timer_period_set = false;
+   }
+#endif
 }
 
 int virgl_renderer_init(void *cookie, int flags, struct virgl_renderer_callbacks *cbs)
@@ -803,24 +850,6 @@ int virgl_renderer_init(void *cookie, int flags, struct virgl_renderer_callbacks
    TRACE_FUNC();
 
    int ret;
-
-#ifdef _WIN32
-   /* Drop Windows system timer to 1ms granularity. By default the timer
-    * tick is 15.625ms (64Hz), which means clock_nanosleep / Sleep / cnd_*
-    * timed waits all round up to 15.625ms even when the requested wait
-    * is microseconds. The vkr ring relax path requests sub-millisecond
-    * sleeps that turn into ~16ms naps in practice, producing visible
-    * frame hitches in Vulkan workloads -- the host dispatcher misses an
-    * entire frame's worth of guest commands while it's asleep. With
-    * timeBeginPeriod(1), the same sleeps are honored at ~1ms or better.
-    *
-    * The cost is a small system-wide CPU bump (timer fires more often).
-    * On modern CPUs this is well under 1% and it's the standard fix every
-    * Windows audio/video application applies. We never call timeEndPeriod;
-    * that's intentional -- the runtime owns the elevated rate for as long
-    * as virglrenderer is loaded, which is the entire QEMU session. */
-   timeBeginPeriod(1);
-#endif
 
    /* VIRGL_RENDERER_THREAD_SYNC is a hint and can be silently ignored */
    if (!has_eventfd() || getenv("VIRGL_DISABLE_MT"))
@@ -846,6 +875,26 @@ int virgl_renderer_init(void *cookie, int flags, struct virgl_renderer_callbacks
       state.cbs = cbs;
       state.client_initialized = true;
    }
+
+#ifdef _WIN32
+   /* Drop Windows system timer to 1ms granularity. By default the timer
+    * tick is 15.625ms (64Hz), which means clock_nanosleep / Sleep / cnd_*
+    * timed waits all round up to 15.625ms even when the requested wait
+    * is microseconds. The vkr ring relax path requests sub-millisecond
+    * sleeps that turn into ~16ms naps in practice, producing visible
+    * frame hitches in Vulkan workloads -- the host dispatcher misses an
+    * entire frame's worth of guest commands while it's asleep. With
+    * timeBeginPeriod(1), the same sleeps are honored at ~1ms or better.
+    *
+    * The cost is a small system-wide CPU bump (timer fires more often).
+    * On modern CPUs this is well under 1% and it's the standard fix every
+    * Windows audio/video application applies. The request is made once and
+    * released again by virgl_renderer_cleanup (which the failure path of
+    * this function also calls), so a host process that stops using the
+    * renderer gets its normal timer rate back. */
+   if (!virgl_win32_timer_period_set && timeBeginPeriod(1) == TIMERR_NOERROR)
+      virgl_win32_timer_period_set = true;
+#endif
 
    if (!state.resource_initialized) {
       const struct virgl_resource_pipe_callbacks *pipe_cbs =
@@ -1010,6 +1059,10 @@ int virgl_renderer_get_fd_for_texture2(uint32_t tex_id, int *fd, int *stride, in
 void virgl_renderer_reset(void)
 {
    TRACE_FUNC();
+#ifdef _WIN32
+   /* winq: all resources go, without virgl_renderer_resource_unref */
+   vrend_winq_share_registry_reset();
+#endif
    if (state.vrend_initialized)
       vrend_renderer_prepare_reset();
 
@@ -1027,6 +1080,16 @@ void virgl_renderer_reset(void)
 
    if (state.drm_initialized)
       drm_renderer_reset();
+}
+
+void virgl_renderer_set_vk_memory_limit(uint64_t limit)
+{
+   vkr_renderer_set_memory_limit(limit);
+}
+
+uint64_t virgl_renderer_get_vk_memory_used(void)
+{
+   return vkr_renderer_get_memory_used();
 }
 
 int virgl_renderer_get_poll_fd(void)

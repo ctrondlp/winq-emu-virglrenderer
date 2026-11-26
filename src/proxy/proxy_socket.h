@@ -24,6 +24,10 @@ proxy_socket_init(struct proxy_socket *socket, int fd);
 void
 proxy_socket_fini(struct proxy_socket *socket);
 
+/* close a socket fd that is not wrapped in a proxy_socket yet */
+void
+proxy_socket_close_fd(int fd);
+
 bool
 proxy_socket_is_connected(const struct proxy_socket *socket);
 

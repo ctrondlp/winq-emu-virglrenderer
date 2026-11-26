@@ -263,7 +263,7 @@ if with_video
 endif
 
 if with_host_windows
-  virgl_sources += ['mman_win32.c']
+  virgl_sources += ['mman_win32.c', 'vrend/vrend_winq_share.c']
   virgl_depends += [meson.get_compiler('c').find_library('ws2_32')]
   # winmm for timeBeginPeriod (system timer resolution control)
   virgl_depends += [meson.get_compiler('c').find_library('winmm')]

@@ -26,6 +26,9 @@
 #include "config.h"
 #endif
 
+#include <stdlib.h>
+#include <string.h>
+
 #include "virgl_util.h"
 
 #include <errno.h>
@@ -42,6 +45,7 @@
 #endif
 
 #include "util/os_misc.h"
+#include "util/os_file.h"
 #include "util/u_pointer.h"
 #include "util/u_string.h"
 
@@ -110,7 +114,10 @@ int create_eventfd(unsigned int initval)
    HANDLE event = CreateEventA(NULL, TRUE, initval ? TRUE : FALSE, NULL);
    if (!event)
       return -1;
-   int fd = _open_osfhandle((intptr_t)event, 0);
+   /* A handle token, not a CRT file descriptor: the CRT descriptor table
+    * is not usable from every host process (and _open_osfhandle failed
+    * inside the VirtualBox VM process). */
+   int fd = os_wrap_win32_handle(event);
    if (fd < 0)
       CloseHandle(event);
    return fd;
@@ -124,7 +131,7 @@ int write_eventfd(int fd, uint64_t val)
 {
 #ifdef _WIN32
    (void)val;
-   HANDLE event = (HANDLE)_get_osfhandle(fd);
+   HANDLE event = os_get_win32_handle_from_fd(fd);
    if (event == INVALID_HANDLE_VALUE)
       return -1;
    return SetEvent(event) ? 0 : -1;
@@ -151,7 +158,7 @@ int write_eventfd(int fd, uint64_t val)
 void flush_eventfd(int fd)
 {
 #ifdef _WIN32
-   HANDLE event = (HANDLE)_get_osfhandle(fd);
+   HANDLE event = os_get_win32_handle_from_fd(fd);
    if (event != INVALID_HANDLE_VALUE)
       ResetEvent(event);
 #else
@@ -437,4 +444,55 @@ void set_dmabuf_name(int fd, const char *name)
    (void)fd;
    (void)name;
    #endif
+}
+
+/* winq: the diagnostic log, see virgl_util.h.  Returns its path, NULL when it is off. */
+static const char *winq_dbg_path(void)
+{
+   static int state;
+   static char path[512];
+   if (!state) {
+      const char *e = getenv("WINQ_DEBUG_LOG");
+      if (e && e[0] && strlen(e) < sizeof(path)) {
+         strcpy(path, e);
+         state = 1;
+      } else {
+         state = -1;
+      }
+   }
+   return state > 0 ? path : NULL;
+}
+
+bool winq_dbg_enabled(void)
+{
+   return winq_dbg_path() != NULL;
+}
+
+void winq_dbg_v(const char *fmt, va_list va)
+{
+   const char *path = winq_dbg_path();
+   FILE *f = path ? fopen(path, "a") : NULL;
+   if (!f)
+      return;
+   vfprintf(f, fmt, va);
+   fputc(10, f);
+   fclose(f);
+}
+
+void winq_dbg(const char *fmt, ...)
+{
+   va_list va;
+   va_start(va, fmt);
+   winq_dbg_v(fmt, va);
+   va_end(va);
+}
+
+bool winq_dbg_cmds(void)
+{
+   static int state;
+   if (!state) {
+      const char *e = getenv("WINQ_DEBUG_CMDS");
+      state = e && e[0] ? 1 : -1;
+   }
+   return state > 0;
 }

@@ -385,7 +385,20 @@ VIRGL_EXPORT void virgl_renderer_cleanup(void *cookie);
 /* reset the rendererer - destroy all contexts and resource */
 VIRGL_EXPORT void virgl_renderer_reset(void);
 
+/* On Windows, the fds this library hands out (this one, exported resources and
+ * blobs) are tokens for handles it keeps, not CRT file descriptors: they must not
+ * be passed to CRT functions such as _get_osfhandle or close. */
 VIRGL_EXPORT int virgl_renderer_get_poll_fd(void);
+
+/* Limit in bytes for the memory the Venus contexts together can allocate on the
+ * host with vkAllocateMemory (0: no limit, the default).  A larger allocation
+ * fails with VK_ERROR_OUT_OF_DEVICE_MEMORY in the guest.  Can be called at any
+ * time; memory already allocated stays.  OpenGL resources are not counted,
+ * including textures backed by Vulkan memory for sharing with Venus. */
+VIRGL_EXPORT void virgl_renderer_set_vk_memory_limit(uint64_t limit);
+
+/* What is counted against that limit now, in bytes. */
+VIRGL_EXPORT uint64_t virgl_renderer_get_vk_memory_used(void);
 
 VIRGL_EXPORT int virgl_renderer_execute(void *execute_args, uint32_t execute_size);
 

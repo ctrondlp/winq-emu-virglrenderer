@@ -111,6 +111,13 @@ struct vrend_resource {
    uint64_t size;
    GLbitfield buffer_storage_flags;
    GLuint memobj;
+#ifdef _WIN32
+   /* winq: the texture's storage is Vulkan memory that a Venus context can import (an NT handle,
+    * NULL if not shared) and its size, see vrend_winq_share.c. */
+   void *winq_share_handle;
+   uint64_t winq_share_size;
+   uint32_t winq_share_mem_type;
+#endif
 
    uint32_t blob_id;
    struct list_head head;

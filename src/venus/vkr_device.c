@@ -367,7 +367,7 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
    /* append extensions for our own use */
    const char **exts = NULL;
    uint32_t guest_ext_count = args->pCreateInfo->enabledExtensionCount;
-   uint32_t ext_count = guest_ext_count + 6;
+   uint32_t ext_count = guest_ext_count + 7;
    exts = malloc(sizeof(*exts) * ext_count);
    if (!exts) {
       args->ret = VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -412,6 +412,20 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
    } else if (physical_dev->KHR_external_semaphore_fd) {
       if (!vkr_device_has_extension(exts, host_ext_count, "VK_KHR_external_semaphore_fd"))
          exts[host_ext_count++] = "VK_KHR_external_semaphore_fd";
+   }
+
+   /* winq: let LINEAR images be color attachments (see vkr_linear_color_attachment_fixup) */
+   VkPhysicalDeviceLinearColorAttachmentFeaturesNV linear_color_attachment = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINEAR_COLOR_ATTACHMENT_FEATURES_NV,
+      .linearColorAttachment = VK_TRUE,
+   };
+   winq_dbg("CreateDevice ctx=%s dev=%s nv=%d", ctx->debug_name ? ctx->debug_name : "?",
+            physical_dev->properties.deviceName, (int)physical_dev->host_linear_color_attachment);
+   if (physical_dev->host_linear_color_attachment) {
+      if (!vkr_device_has_extension(exts, host_ext_count, "VK_NV_linear_color_attachment"))
+         exts[host_ext_count++] = "VK_NV_linear_color_attachment";
+      linear_color_attachment.pNext = (void *)args->pCreateInfo->pNext;
+      ((VkDeviceCreateInfo *)args->pCreateInfo)->pNext = &linear_color_attachment;
    }
 
    ((VkDeviceCreateInfo *)args->pCreateInfo)->ppEnabledExtensionNames = exts;

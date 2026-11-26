@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "vkr_image.h"
 #include "vkr_command_buffer.h"
 
 #include "vkr_command_buffer_gen.h"
@@ -444,6 +445,32 @@ static void
 vkr_dispatch_vkCmdPipelineBarrier(UNUSED struct vn_dispatch_context *dispatch,
                                   struct vn_command_vkCmdPipelineBarrier *args)
 {
+   if (winq_dbg_cmds()) {
+      for (uint32_t i = 0; i < args->imageMemoryBarrierCount; i++) {
+         const VkImageMemoryBarrier *b = &args->pImageMemoryBarriers[i];
+         winq_dbg("  BARRIER image=%p layout %d -> %d family 0x%x -> 0x%x access 0x%x -> 0x%x aspect 0x%x mips %u+%u layers %u+%u stages 0x%x -> 0x%x",
+                  (void *)(uintptr_t)b->image, (int)b->oldLayout, (int)b->newLayout, b->srcQueueFamilyIndex, b->dstQueueFamilyIndex,
+                  b->srcAccessMask, b->dstAccessMask, b->subresourceRange.aspectMask, b->subresourceRange.baseMipLevel,
+                  b->subresourceRange.levelCount, b->subresourceRange.baseArrayLayer, b->subresourceRange.layerCount,
+                  args->srcStageMask, args->dstStageMask);
+      }
+   }
+#ifdef _WIN32
+   /* winq: an image bound to the memory of an OpenGL texture comes from another driver as far as the
+    * guest can tell, so it hands the image over with VK_QUEUE_FAMILY_FOREIGN_EXT.  On the host both
+    * sides are the same driver, which is what VK_QUEUE_FAMILY_EXTERNAL says (and the host driver loses
+    * the device on a foreign hand-over of such an image to a queue family without graphics). */
+   for (uint32_t i = 0; i < args->imageMemoryBarrierCount; i++) {
+      VkImageMemoryBarrier *b = (VkImageMemoryBarrier *)&args->pImageMemoryBarriers[i];
+      const struct vkr_image *img = vkr_image_from_handle(b->image);
+      if (img && img->winq_gl_bound) {
+         if (b->srcQueueFamilyIndex == VK_QUEUE_FAMILY_FOREIGN_EXT)
+            b->srcQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+         if (b->dstQueueFamilyIndex == VK_QUEUE_FAMILY_FOREIGN_EXT)
+            b->dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+      }
+   }
+#endif
    VKR_CMD_CALL(CmdPipelineBarrier, args, args->srcStageMask, args->dstStageMask,
                 args->dependencyFlags, args->memoryBarrierCount, args->pMemoryBarriers,
                 args->bufferMemoryBarrierCount, args->pBufferMemoryBarriers,
@@ -811,6 +838,19 @@ static void
 vkr_dispatch_vkCmdPipelineBarrier2(UNUSED struct vn_dispatch_context *ctx,
                                    struct vn_command_vkCmdPipelineBarrier2 *args)
 {
+#ifdef _WIN32
+   /* winq: see vkr_dispatch_vkCmdPipelineBarrier */
+   for (uint32_t i = 0; args->pDependencyInfo && i < args->pDependencyInfo->imageMemoryBarrierCount; i++) {
+      VkImageMemoryBarrier2 *b = (VkImageMemoryBarrier2 *)&args->pDependencyInfo->pImageMemoryBarriers[i];
+      const struct vkr_image *img = vkr_image_from_handle(b->image);
+      if (img && img->winq_gl_bound) {
+         if (b->srcQueueFamilyIndex == VK_QUEUE_FAMILY_FOREIGN_EXT)
+            b->srcQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+         if (b->dstQueueFamilyIndex == VK_QUEUE_FAMILY_FOREIGN_EXT)
+            b->dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+      }
+   }
+#endif
    VKR_CMD_CALL(CmdPipelineBarrier2, args, args->pDependencyInfo);
 }
 

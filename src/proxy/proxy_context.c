@@ -23,6 +23,7 @@
 #include "util/os_file.h"
 
 #include "proxy_client.h"
+#include "vrend/vrend_winq_share.h"
 
 struct proxy_fence {
    uint32_t flags;
@@ -178,7 +179,7 @@ proxy_context_sync_thread(void *arg)
 
    while (!ctx->sync_thread.stop) {
 #ifdef _WIN32
-      HANDLE event = (HANDLE)_get_osfhandle(ctx->sync_thread.fence_eventfd);
+      HANDLE event = os_get_win32_handle_from_fd(ctx->sync_thread.fence_eventfd);
       DWORD wait_ret = WaitForSingleObject(event, 100); /* 100ms timeout */
       if (wait_ret == WAIT_FAILED) {
          proxy_log("failed to wait on fence event");
@@ -401,7 +402,7 @@ proxy_context_get_blob(struct virgl_context *base,
       break;
    case VIRGL_RESOURCE_FD_SHM:
 #ifdef _WIN32
-      /* On Windows, the fd is a raw HANDLE from CreateFileMapping.
+      /* On Windows, the fd is a handle token for a file mapping (os_wrap_win32_handle).
        * File seals and lseek validation don't apply.
        */
       reply_fd_valid = true;
@@ -470,6 +471,8 @@ proxy_context_attach_resource(struct virgl_context *base, struct virgl_resource 
    struct proxy_context *ctx = (struct proxy_context *)base;
    const uint32_t res_id = res->res_id;
 
+   winq_dbg("Attach ctx=%d res=%u fd_type=%d known=%d", ctx->base.ctx_id, res_id, (int)res->fd_type,
+            proxy_context_resource_find(ctx, res_id) ? 1 : 0);
    /* avoid importing resources created from RENDER_CONTEXT_OP_CREATE_RESOURCE */
    if (proxy_context_resource_find(ctx, res_id))
       return;
@@ -478,9 +481,19 @@ proxy_context_attach_resource(struct virgl_context *base, struct virgl_resource 
     * that can be exported to dma-buf. A protocol change is needed when there exists use
     * case for importing external Vulkan opaque resource.
     */
+#ifdef _WIN32
+   /* winq: the render server shares the process (and so the handle table) with this library and its
+    * Venus context imports an opaque resource (an NT handle) as it does a dma-buf, so a buffer that one
+    * context allocated and another imports (Xwayland's windows, imported by gamescope) can be attached
+    * to the second context too. */
+   const bool winq_opaque_ok = res->fd_type == VIRGL_RESOURCE_FD_OPAQUE;
+#else
+   const bool winq_opaque_ok = false;
+#endif
    if (res->fd_type != VIRGL_RESOURCE_FD_INVALID &&
        res->fd_type != VIRGL_RESOURCE_FD_DMABUF &&
-       res->fd_type != VIRGL_RESOURCE_FD_SHM) {
+       res->fd_type != VIRGL_RESOURCE_FD_SHM &&
+       !winq_opaque_ok) {
       proxy_log("failed to attach res %d with fd_type %d", res_id, res->fd_type);
       return;
    }
@@ -489,9 +502,29 @@ proxy_context_attach_resource(struct virgl_context *base, struct virgl_resource 
    int res_fd = res->fd;
    uint64_t res_size = res->map_size;
    bool close_res_fd = false;
+#ifdef _WIN32
+   /* winq: not (yet) known to be an OpenGL texture with Vulkan memory */
+   uint32_t winq_mem_type = 0;
+   void *winq_handle = NULL;
+   bool winq_shared = false;
+#endif
    if (res_fd_type == VIRGL_RESOURCE_FD_INVALID) {
       /* importable pipe resouce can only export as dma-buf */
       res_fd_type = virgl_resource_export_fd(res, &res_fd);
+      winq_dbg("ATTACH pipe res=%u ctx=%u export type=%d fd=%d", res_id, ctx->base.ctx_id, (int)res_fd_type, res_fd);
+#ifdef _WIN32
+      /* winq: an OpenGL texture with Vulkan memory exports that memory's handle; there is no file to
+       * ask for the size. */
+      const uint64_t winq_size =
+         res_fd_type == VIRGL_RESOURCE_FD_OPAQUE && res->pipe_resource
+            ? vrend_renderer_winq_share_size(res->pipe_resource, &winq_mem_type, &winq_handle)
+            : 0;
+      if (winq_size) {
+         res_size = winq_size;
+         close_res_fd = true;
+         winq_shared = true;
+      } else
+#endif
       if (res_fd_type != VIRGL_RESOURCE_FD_DMABUF) {
          /* close fd for unexpected fd type from succeeded export */
          if (res_fd_type != VIRGL_RESOURCE_FD_INVALID)
@@ -504,10 +537,16 @@ proxy_context_attach_resource(struct virgl_context *base, struct virgl_resource 
        * - pipe resource created by vrend has a zero map_size
        * - blob resource created by vrend can have non-zero fake map_size
        */
-      res_size = lseek(res_fd, 0, SEEK_END);
-
-      close_res_fd = true;
+      else {
+         res_size = lseek(res_fd, 0, SEEK_END);
+         close_res_fd = true;
+      }
    }
+
+#ifdef _WIN32
+   /* winq: the importing Venus context looks this up when the request below reaches it */
+   vrend_winq_share_registry_set(res_id, winq_shared, winq_mem_type, winq_handle);
+#endif
 
    /* the proxy ignores iovs since transfer_3d is not supported */
    const struct render_context_op_import_resource_request req = {
@@ -721,7 +760,7 @@ proxy_context_create(uint32_t ctx_id,
 
    ctx = calloc(1, sizeof(*ctx));
    if (!ctx) {
-      os_close_fd(ctx_fd);
+      proxy_socket_close_fd(ctx_fd);
       return NULL;
    }
 

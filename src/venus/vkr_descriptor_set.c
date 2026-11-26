@@ -139,6 +139,19 @@ vkr_dispatch_vkUpdateDescriptorSets(UNUSED struct vn_dispatch_context *dispatch,
    struct vkr_device *dev = vkr_device_from_handle(args->device);
    struct vn_device_proc_table *vk = &dev->proc_table;
 
+   if (winq_dbg_cmds()) {
+      for (uint32_t i = 0; i < args->descriptorWriteCount; i++) {
+         const VkWriteDescriptorSet *w = &args->pDescriptorWrites[i];
+         if (w->pImageInfo && (w->descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ||
+                               w->descriptorType == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ||
+                               w->descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)) {
+            for (uint32_t j = 0; j < w->descriptorCount; j++)
+               winq_dbg("  DESC binding %u[%u] type %d view=%p sampler=%p layout %d", w->dstBinding, w->dstArrayElement + j,
+                        (int)w->descriptorType, (void *)(uintptr_t)w->pImageInfo[j].imageView,
+                        (void *)(uintptr_t)w->pImageInfo[j].sampler, (int)w->pImageInfo[j].imageLayout);
+         }
+      }
+   }
    vn_replace_vkUpdateDescriptorSets_args_handle(args);
    vk->UpdateDescriptorSets(args->device, args->descriptorWriteCount,
                             args->pDescriptorWrites, args->descriptorCopyCount,

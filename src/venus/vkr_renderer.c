@@ -10,6 +10,7 @@
 #include "venus_hw.h"
 
 #include "vkr_context.h"
+#include "vkr_device_memory.h"
 
 struct vkr_renderer_state {
    const struct vkr_renderer_callbacks *cbs;
@@ -69,12 +70,27 @@ vkr_renderer_init(uint32_t flags, const struct vkr_renderer_callbacks *cbs)
       return false;
 
    vkr_debug_init();
-   virgl_log_set_handler(cbs->debug_logger, NULL, NULL);
+   /* winq: a renderer running inside the embedder's process (the in-process render server) passes no
+    * logger and keeps the one the embedder installed: there is only one per process. */
+   if (cbs->debug_logger)
+      virgl_log_set_handler(cbs->debug_logger, NULL, NULL);
 
    vkr_state.cbs = cbs;
    list_inithead(&vkr_state.contexts);
 
    return true;
+}
+
+void
+vkr_renderer_set_memory_limit(uint64_t limit)
+{
+   vkr_device_memory_set_limit(limit);
+}
+
+uint64_t
+vkr_renderer_get_memory_used(void)
+{
+   return vkr_device_memory_used();
 }
 
 void

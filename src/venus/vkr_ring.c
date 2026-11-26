@@ -308,7 +308,7 @@ vkr_ring_thread(void *arg)
       static int avrt_tried = 0;
       if (!avrt_tried) {
          avrt_tried = 1;
-         HMODULE h = LoadLibraryW(L"avrt.dll");
+         HMODULE h = LoadLibraryExW(L"avrt.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
          if (h)
             pAvSet = (PFN_AvSetMmThreadCharacteristicsW)
                GetProcAddress(h, "AvSetMmThreadCharacteristicsW");
@@ -354,7 +354,25 @@ vkr_ring_thread(void *arg)
 
          mtx_lock(&ring->mutex);
          while (ring->started && !ring->pending_notify) {
-            ret = cnd_wait(&ring->cond, &ring->mutex);
+            /* winq: a lost wakeup must not hang the guest.  The guest stores the ring tail and then looks at
+             * the idle bit, we set the idle bit and then look at the tail; without a full barrier on both
+             * sides (or when the guest maps the ring write-combining) both can miss each other's store, and
+             * then nothing would ever wake this thread.  So sleep in short slices and look at the tail again
+             * after each one (the Windows cnd_timedwait returns thrd_busy on a timeout). */
+            struct timespec abs_ts;
+            clock_gettime(CLOCK_REALTIME, &abs_ts);
+            abs_ts.tv_nsec += 2000000;
+            if (abs_ts.tv_nsec >= 1000000000) {
+               abs_ts.tv_sec++;
+               abs_ts.tv_nsec -= 1000000000;
+            }
+            ret = cnd_timedwait(&ring->cond, &ring->mutex, &abs_ts);
+            if (ret == thrd_timeout || ret == thrd_busy) {
+               ret = 0;
+               if (ring->buffer.cur != vkr_ring_load_tail(ring))
+                  break;
+               continue;
+            }
             if (ret != thrd_success) {
                vkr_log("%s: ring idle cnd_wait has failed(%d)", __func__, ret);
                ret = -EINVAL;

@@ -108,16 +108,23 @@ os_fd_is_handle_token(int fd)
 HANDLE
 os_get_win32_handle_from_fd(int fd)
 {
-   intptr_t crt_handle = _get_osfhandle(fd);
-   if (crt_handle != -1)
-      return (HANDLE)crt_handle;
-
+   /* Look up handle tokens first.  Passing a token (or any other value that
+    * is not a CRT fd) to _get_osfhandle invokes the CRT invalid parameter
+    * handler, which terminates the process unless the host executable
+    * installed a non-default handler (MinGW executables do, other hosts
+    * usually do not).
+    */
    os_win32_handle_ensure_init();
    EnterCriticalSection(&os_win32_handle_mutex);
    const ptrdiff_t idx = os_win32_handle_find_index_locked(fd);
    HANDLE handle = idx >= 0 ? os_win32_handles[idx].handle : INVALID_HANDLE_VALUE;
    LeaveCriticalSection(&os_win32_handle_mutex);
-   return handle;
+   if (idx >= 0)
+      return handle;
+
+   if (fd < 0)
+      return INVALID_HANDLE_VALUE;
+   return (HANDLE)_get_osfhandle(fd);
 }
 
 int

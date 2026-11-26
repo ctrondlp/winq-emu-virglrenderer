@@ -54,6 +54,10 @@
 struct vrend_decode_ctx {
    struct virgl_context base;
    struct vrend_context *grctx;
+   /* the refusal of commands after a context error was reported (once) */
+   bool refusal_reported;
+   /* an unknown command was reported (once) */
+   bool unknown_reported;
 };
 
 static inline uint32_t get_buf_entry(const uint32_t *buf, uint32_t offset)
@@ -1647,6 +1651,8 @@ struct virgl_context *vrend_renderer_context_create(uint32_t handle,
       return NULL;
 
    vrend_decode_ctx_init_base(dctx, handle);
+   dctx->refusal_reported = false;
+   dctx->unknown_reported = false;
 
    dctx->grctx = vrend_create_context(handle, nlen, debug_name);
    if (!dctx->grctx) {
@@ -2058,8 +2064,13 @@ static int vrend_decode_ctx_submit_cmd(struct virgl_context *ctx,
 #define TRANSFER_HEADER_SIZE 4096
 
    bret = vrend_hw_switch_context(gdctx->grctx, true);
-   if (bret == false)
+   if (bret == false) {
+      if (!gdctx->refusal_reported) {
+         gdctx->refusal_reported = true;
+         virgl_error("context %d refuses all further commands: it is in the error state\n", gdctx->base.ctx_id);
+      }
       return EINVAL;
+   }
 
    if (VREND_DEBUG_ENABLED &&
        vrend_debug(gdctx->grctx, dbg_dump_cmd_streams) &&
@@ -2078,8 +2089,13 @@ static int vrend_decode_ctx_submit_cmd(struct virgl_context *ctx,
       uint32_t len = *buf >> 16;
       uint32_t cmd = *buf & 0xff;
 
-      if (cmd >= VIRGL_MAX_COMMANDS)
+      if (cmd >= VIRGL_MAX_COMMANDS) {
+         if (!gdctx->unknown_reported) {
+            gdctx->unknown_reported = true;
+            virgl_error("context %d: unknown command %u (header 0x%x)\n", gdctx->base.ctx_id, cmd, *buf);
+         }
          return EINVAL;
+      }
 
       buf_offset += len + 1;
 

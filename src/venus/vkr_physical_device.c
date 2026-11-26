@@ -185,6 +185,49 @@ vkr_physical_device_init_memory_properties(struct vkr_physical_device *physical_
 
    VkPhysicalDevice handle = physical_dev->base.handle.physical_device;
    vk->GetPhysicalDeviceMemoryProperties(handle, &physical_dev->memory_properties);
+   for (uint32_t i = 0; i < VK_MAX_MEMORY_TYPES; i++)
+      physical_dev->memory_type_redirect[i] = i;
+
+#ifdef _WIN32
+   /* winq: device local + host visible memory types (resizable BAR VRAM) are not given to the guest as
+    * they are.  With the NVIDIA driver an exportable allocation of such a type fails
+    * (VK_ERROR_OUT_OF_DEVICE_MEMORY) as soon as an exportable system memory block exists, and the guest,
+    * which allocates asynchronously, then refers to a memory object that was never created, which is
+    * fatal for the whole context.  Such a type keeps its index and is either backed by system memory or
+    * loses its host bits (below).  Set VKR_KEEP_BAR_MEMORY to keep the old behaviour. */
+   if (!getenv("VKR_KEEP_BAR_MEMORY")) {
+      VkPhysicalDeviceMemoryProperties *mp = &physical_dev->memory_properties;
+      /* Some guest software (gamescope's upload buffer) needs one type that is device local, host
+       * visible and host coherent.  Keep such a type visible to the guest, but let vkAllocateMemory
+       * back it with a plain host visible + host coherent system memory type (never device local,
+       * not cached), which is the kind of allocation that works.  Without such a host type fall
+       * back to hiding the host bits.  Set VKR_HIDE_BAR_MEMORY to always hide them. */
+      int32_t host_type = -1;
+      if (!getenv("VKR_HIDE_BAR_MEMORY")) {
+         const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+         for (uint32_t i = 0; i < mp->memoryTypeCount && host_type < 0; i++) {
+            const VkMemoryPropertyFlags f = mp->memoryTypes[i].propertyFlags;
+            if ((f & want) == want && !(f & (VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                                             VK_MEMORY_PROPERTY_HOST_CACHED_BIT)))
+               host_type = (int32_t)i;
+         }
+      }
+      for (uint32_t i = 0; i < mp->memoryTypeCount; i++) {
+         VkMemoryPropertyFlags *f = &mp->memoryTypes[i].propertyFlags;
+         if ((*f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) && (*f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
+            if (host_type >= 0) {
+               *f |= VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+               *f &= ~VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+               physical_dev->memory_type_redirect[i] = (uint32_t)host_type;
+            } else {
+               *f &= ~(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                       VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+            }
+         }
+      }
+   }
+#endif
 
    /* XXX When a VkMemoryType has VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, we
     * assume any VkDeviceMemory with the memory type can be made external and
@@ -329,6 +372,9 @@ vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev)
 
       if (!strcmp(props->extensionName, "VK_KHR_swapchain"))
          saw_host_swapchain = true;
+
+      if (!strcmp(props->extensionName, "VK_NV_linear_color_attachment"))
+         physical_dev->host_linear_color_attachment = true;
 
       if (!strcmp(props->extensionName, "VK_KHR_external_memory_fd"))
          physical_dev->KHR_external_memory_fd = true;
@@ -773,6 +819,41 @@ vkr_dispatch_vkGetPhysicalDeviceMemoryProperties(
    *args->pMemoryProperties = physical_dev->memory_properties;
 }
 
+/*
+ * winq: NVIDIA reports the color attachment ability of LINEAR images only through
+ * VK_NV_linear_color_attachment (a bit in VkFormatProperties3, not in the 32-bit flags), so a guest
+ * that looks at the standard flags (Zink, to allocate a render target it can share) sees linear
+ * images as not renderable.  Report the standard bits when the NV one is set; vkr_device enables the
+ * NV feature on the host device so creating such an image then works.  host_physical_device is the
+ * host handle.
+ */
+static void
+vkr_linear_color_attachment_fixup(struct vkr_physical_device *physical_dev,
+                                  VkPhysicalDevice host_physical_device,
+                                  VkFormat format,
+                                  VkFormatProperties *fp,
+                                  VkFormatProperties3 *fp3)
+{
+   struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
+   VkFormatProperties3 p3 = { .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3 };
+   VkFormatProperties2 p2 = { .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2, .pNext = &p3 };
+
+   if (!physical_dev->host_linear_color_attachment || !vk->GetPhysicalDeviceFormatProperties2)
+      return;
+   if (fp->linearTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)
+      return;
+
+   vk->GetPhysicalDeviceFormatProperties2(host_physical_device, format, &p2);
+   if (!(p3.linearTilingFeatures & VK_FORMAT_FEATURE_2_LINEAR_COLOR_ATTACHMENT_BIT_NV))
+      return;
+
+   fp->linearTilingFeatures |= VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
+                               VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT;
+   if (fp3)
+      fp3->linearTilingFeatures |= VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT |
+                                   VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BLEND_BIT;
+}
+
 static void
 vkr_dispatch_vkGetPhysicalDeviceFormatProperties(
    UNUSED struct vn_dispatch_context *dispatch,
@@ -785,6 +866,8 @@ vkr_dispatch_vkGetPhysicalDeviceFormatProperties(
    vn_replace_vkGetPhysicalDeviceFormatProperties_args_handle(args);
    vk->GetPhysicalDeviceFormatProperties(args->physicalDevice, args->format,
                                          args->pFormatProperties);
+   vkr_linear_color_attachment_fixup(physical_dev, args->physicalDevice, args->format,
+                                     args->pFormatProperties, NULL);
 }
 
 static void
@@ -980,6 +1063,9 @@ vkr_dispatch_vkGetPhysicalDeviceFormatProperties2(
    vn_replace_vkGetPhysicalDeviceFormatProperties2_args_handle(args);
    vk->GetPhysicalDeviceFormatProperties2(args->physicalDevice, args->format,
                                           args->pFormatProperties);
+   vkr_linear_color_attachment_fixup(
+      physical_dev, args->physicalDevice, args->format, &args->pFormatProperties->formatProperties,
+      (VkFormatProperties3 *)vkr_find_struct(args->pFormatProperties->pNext, VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3));
 
 #ifdef _WIN32
    if (modifier_node) {
@@ -1070,6 +1156,12 @@ vkr_dispatch_vkGetPhysicalDeviceImageFormatProperties2(
       (void)strip_chain;
    }
 #endif
+
+   /* winq: what vkCreateImage would create, see vkr_linear_image_usage */
+   if (args->pImageFormatInfo->tiling == VK_IMAGE_TILING_LINEAR) {
+      VkPhysicalDeviceImageFormatInfo2 *info = (VkPhysicalDeviceImageFormatInfo2 *)args->pImageFormatInfo;
+      info->usage = vkr_linear_image_usage(info->type, info->format, info->usage);
+   }
 
    vn_replace_vkGetPhysicalDeviceImageFormatProperties2_args_handle(args);
    args->ret = vk->GetPhysicalDeviceImageFormatProperties2(

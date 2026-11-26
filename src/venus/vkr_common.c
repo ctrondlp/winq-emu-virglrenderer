@@ -238,6 +238,11 @@ vkr_log(const char *fmt, ...)
    va_start(va, fmt);
    virgl_prefixed_logv("vkr", VIRGL_LOG_LEVEL_INFO, fmt, va);
    va_end(va);
+
+   /* winq: also in the debug log, in order with its own lines */
+   va_start(va, fmt);
+   winq_dbg_v(fmt, va);
+   va_end(va);
 }
 
 void

@@ -35,6 +35,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <stdint.h>
+#include "os_file.h"
 #else
 #include <unistd.h>
 #include <fcntl.h>
@@ -122,47 +123,31 @@ create_tmpfile_cloexec(char *tmpname)
 #endif /* !_WIN32 - close guard around helper functions */
 
 #ifdef _WIN32
+/*
+ * Back the "anonymous file" with an unnamed, pagefile-backed section instead
+ * of a file in %TEMP%: other processes cannot open it by name, and its
+ * contents (guest ring buffers, fence seqnos) are never written to a file on
+ * disk other than the pagefile.  The section handle is returned as a handle
+ * token (see os_wrap_win32_handle); mmap() in mman_win32.c maps tokens
+ * directly, and os_close_fd() / os_dupfd_cloexec() handle them.
+ */
 int
 os_create_anonymous_file(off_t size, const char *debug_name)
 {
-   char temp_path[MAX_PATH];
-   char temp_file[MAX_PATH];
+   (void)debug_name;
 
-   DWORD path_len = GetTempPathA(MAX_PATH, temp_path);
-   if (!path_len || path_len >= MAX_PATH)
+   if (size <= 0)
       return -1;
 
-   UINT name_ret = GetTempFileNameA(temp_path,
-                                    (debug_name && debug_name[0]) ? debug_name : "vrg",
-                                    0, temp_file);
-   if (!name_ret)
+   const uint64_t size64 = (uint64_t)size;
+   HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
+                                       (DWORD)(size64 >> 32), (DWORD)size64, NULL);
+   if (!section)
       return -1;
 
-   HANDLE file = CreateFileA(temp_file,
-                             GENERIC_READ | GENERIC_WRITE,
-                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                             NULL,
-                             CREATE_ALWAYS,
-                             FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE,
-                             NULL);
-   if (file == INVALID_HANDLE_VALUE) {
-      DeleteFileA(temp_file);
-      return -1;
-   }
-
-   LARGE_INTEGER file_size;
-   file_size.QuadPart = size;
-   if (!SetFilePointerEx(file, file_size, NULL, FILE_BEGIN) ||
-       !SetEndOfFile(file)) {
-      CloseHandle(file);
-      DeleteFileA(temp_file);
-      return -1;
-   }
-
-   int fd = _open_osfhandle((intptr_t)file, _O_BINARY);
+   int fd = os_wrap_win32_handle(section);
    if (fd < 0) {
-      CloseHandle(file);
-      DeleteFileA(temp_file);
+      CloseHandle(section);
       return -1;
    }
 

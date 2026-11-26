@@ -18,6 +18,8 @@
 
 #ifdef _WIN32
 
+#include <stdbool.h>
+
 struct vkr_device;
 
 /*
@@ -39,6 +41,9 @@ struct vkr_device;
  */
 void
 vkr_win32_device_install_shim(struct vkr_device *dev);
+
+/* winq: see vkr_win32_shim.c */
+extern _Thread_local bool vkr_win32_shim_keep_tiling;
 
 /*
  * Unregister a device from the shim's device map and restore the

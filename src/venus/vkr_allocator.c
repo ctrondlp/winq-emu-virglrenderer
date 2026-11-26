@@ -180,6 +180,12 @@ vkr_allocator_allocate_memory(struct virgl_resource *res)
       return NULL;
    }
 
+#ifdef _WIN32
+   /* Unlike fd imports, importing an NT handle does not transfer its
+    * ownership to the driver; the caller must close it.
+    */
+   CloseHandle(dup_handle);
+#endif
    os_close_fd(fd);
 
    struct vkr_opaque_fd_mem_info *mem_info = calloc(1, sizeof(*mem_info));
